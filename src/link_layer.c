@@ -77,14 +77,16 @@ int llOpenTx(LinkLayer llParameters)
                 break; 
             case FLAG_RCV:
                 if (byte == A_RX) state = A_RCV;
-                else state = START;
+                else if (byte != FLAG) state = START;
                 break;
             case A_RCV:
                 if (byte == UA) state = C_RCV;
+                else if (byte == FLAG) state = FLAG_RCV;
                 else state = START;
                 break;
             case C_RCV:
                 if (byte == (A_RX ^ UA)) state = BCC_RCV;
+                else if (byte == FLAG) state = FLAG_RCV;
                 else state = START;
                 break; 
             case BCC_RCV:
