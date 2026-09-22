@@ -40,7 +40,7 @@ check_files:
 cable: $(CABLE)/cable.c
 	$(CC) $(CFLAGS) -o $(BIN)/$@ $^
 
-.PHONY: run_cable
+.PHONY: cable run_cable
 run_cable: cable
 	@which socat || { echo "Error: Could not find socat. Install socat and try again."; exit 1; }
 	./$(BIN)/cable
