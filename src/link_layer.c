@@ -7,10 +7,15 @@
 
 #include <stdio.h>
 #include <unistd.h>
+#include <signal.h>
+#include <errno.h>
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
 #define BUF_SIZE 5
+
+#define TRUE 1
+#define FALSE 0
 
 #define FLAG 0x7E
 #define A_TX 0x03
@@ -18,24 +23,28 @@
 #define SET 0x03
 #define UA 0x07
 
+static int alarmEnabled = FALSE;
+static int alarmCount = 0; 
+
 typedef enum {
     START,
     FLAG_RCV,
     A_RCV,
     C_RCV,
-    BCC_RCV,
+    BCC_OK,
     STOP
 } State; 
 
-////////////////////////////////////////////////
+
+static void alarmHandler(int signal) {
+    alarmEnabled = FALSE;
+    alarmCount++;
+}
+
+////////////////////////////////////////////////    
 // LLOPEN
 ////////////////////////////////////////////////
-int llOpenTx(LinkLayer llParameters)
-{
-    // ----------------------------------------------------
-    // This example code shows how to open the serial port and send a string.
-    // TODO: Adapt and extend this code according to the specifications of the project.
-    // ----------------------------------------------------
+int llOpenTx(LinkLayer llParameters) {
 
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
     {
@@ -45,65 +54,100 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    // Create string to send
-    unsigned char set[BUF_SIZE] = {FLAG, A_TX, SET, A_TX ^ SET, FLAG};
-
-    int bytes = writeBytesSerialPort(set, BUF_SIZE);
-    // printf("Tx SET = 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
-    //       set[0], set[1], set[2], set[3], set[4]);
-
-    State state = START;
-    int nBytesBuf = 0;
-    
-
-    printf("%d bytes written to serial port\n", bytes);
-    
-    while (state != STOP) {
-        unsigned char byte;
-        int bytes = readByteSerialPort(&byte);
-        if (bytes < 0)
-        {
-            perror("readByteSerialPort");
-            return -1;
-        }
-        if (bytes == 0)
-            continue;
-
-        // printf("Tx received byte = 0x%02X\n", byte);
-        switch (state)
-        {
-            case START:
-                if (byte == FLAG) state = FLAG_RCV;
-                break; 
-            case FLAG_RCV:
-                if (byte == A_RX) state = A_RCV;
-                else if (byte != FLAG) state = START;
-                break;
-            case A_RCV:
-                if (byte == UA) state = C_RCV;
-                else if (byte == FLAG) state = FLAG_RCV;
-                else state = START;
-                break;
-            case C_RCV:
-                if (byte == (A_RX ^ UA)) state = BCC_RCV;
-                else if (byte == FLAG) state = FLAG_RCV;
-                else state = START;
-                break; 
-            case BCC_RCV:
-                if (byte == FLAG) state = STOP;
-                else state = START;
-                break;
-            case STOP:
-                break;    
-        }
-
-        nBytesBuf += bytes;
-
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1) {
+        perror("sigaction");
+        closeSerialPort();
+        return -1; 
     }
 
-    // Wait until all bytes have been written to the serial port
-    sleep(1);
+    // Create string to send
+    unsigned char set[BUF_SIZE] = {FLAG, A_TX, SET, A_TX ^ SET, FLAG};
+    
+    for (int att = 0; att <= llParameters.nRetransmissions; att++) {
 
+        State state = START;
+        int nBytesBuf = 0;
+
+        int bytes = writeBytesSerialPort(set, BUF_SIZE);
+        if (bytes != BUF_SIZE) {
+            if (bytes < 0) perror("writeBytesSerialPort");
+            else fprintf(stderr, "Incomplete SET frame written\n");
+            closeSerialPort();
+            return -1;
+        }
+        // printf("Tx SET = 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
+        //       set[0], set[1], set[2], set[3], set[4]);
+        
+        alarmEnabled = TRUE;
+        alarm(llParameters.timeout); 
+
+        printf("%d bytes written to serial port\n", bytes);
+        
+        while (state != STOP && alarmEnabled) {
+            unsigned char byte;
+            int bytes = readByteSerialPort(&byte);
+
+            if (bytes < 0)
+            {
+                if (errno == EINTR) {
+                    if (!alarmEnabled) break;
+                    continue;
+                }
+                alarmEnabled = FALSE;
+                alarm(0);
+                perror("readByteSerialPort");
+                closeSerialPort();
+                return -1;
+            }
+            if (bytes == 0)
+                continue;
+
+            // printf("Tx received byte = 0x%02X\n", byte);
+            switch (state)
+            {
+                case START:
+                    if (byte == FLAG) state = FLAG_RCV;
+                    break; 
+                case FLAG_RCV:
+                    if (byte == A_RX) state = A_RCV;
+                    else if (byte != FLAG) state = START;
+                    break;
+                case A_RCV:
+                    if (byte == UA) state = C_RCV;
+                    else if (byte == FLAG) state = FLAG_RCV;
+                    else state = START;
+                    break;
+                case C_RCV:
+                    if (byte == (A_RX ^ UA)) state = BCC_OK;
+                    else if (byte == FLAG) state = FLAG_RCV;
+                    else state = START;
+                    break; 
+                case BCC_OK:
+                    if (byte == FLAG) state = STOP;
+                    else state = START;
+                    break;
+                case STOP: 
+                    break;
+            }
+            
+            nBytesBuf += bytes;   
+        }
+
+        alarmEnabled = FALSE;
+        alarm(0);
+        if (state == STOP) {
+            if (closeSerialPort() < 0) {
+                perror("closeSerialPort");
+                return -1;
+            }
+
+            printf("Serial port %s closed\n", llParameters.serialPort);
+            return 0;
+        }
+    }
+    
     // Close serial port
     if (closeSerialPort() < 0)
     {
@@ -113,7 +157,7 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s closed\n", llParameters.serialPort);
 
-    return 0;
+    return -1;
 }
 
 int llOpenRx(LinkLayer llParameters)
@@ -162,11 +206,11 @@ int llOpenRx(LinkLayer llParameters)
             else state = START;
             break;
         case C_RCV:
-            if (byte == (A_TX ^ SET)) state = BCC_RCV;
+            if (byte == (A_TX ^ SET)) state = BCC_OK;
             else if (byte == FLAG) state = FLAG_RCV;
             else state = START;
             break;
-        case BCC_RCV:
+        case BCC_OK:
             if (byte == FLAG) state = STOP;
             else state = START;
             break;
