@@ -45,45 +45,36 @@ static void alarmHandler(int signal) {
     alarmCount++;
 }
 
-void frameStateHandler(Machine m, unsigned char byte, State state) {
-    switch (state)
+void frameStateHandler(Machine m, unsigned char byte, State *state) {
+
+    unsigned char expectedA = (m == TRANSMITTER) ? A_RX : A_TX;
+    unsigned char expectedC = (m == TRANSMITTER) ? UA : SET;
+    unsigned char expectedBCC = (m == TRANSMITTER) ? (A_RX ^ UA) : (A_TX ^ SET);
+
+
+    switch (*state)
     {
         case START:
-            if (byte == FLAG) state = FLAG_RCV;
+            if (byte == FLAG) *state = FLAG_RCV;
             break; 
         case FLAG_RCV:
-            if (m == TRANSMITTER) {
-                if (byte == A_RX) state = A_RCV;
-            } else {
-                if (byte == A_TX) state = A_RCV;
-            }
-
-            if (byte == FLAG) state = FLAG_RCV;
-            else state = START;
+            if (byte == expectedA) *state = A_RCV;
+            else if (byte == FLAG) *state = FLAG_RCV;
+            else *state = START;
             break;   
         case A_RCV:
-            if (m == TRANSMITTER) {
-                if (byte == UA) state = C_RCV;
-            } else {
-                if (byte == SET) state = C_RCV;
-            }
-
-            if (byte == FLAG) state = FLAG_RCV;
-            else state = START;
+            if (byte == expectedC) *state = C_RCV;
+            else if (byte == FLAG) *state = FLAG_RCV;
+            else *state = START;
             break;   
         case C_RCV:
-            if (m == TRANSMITTER) {
-                if (byte == (A_RX ^ UA)) state = BCC_OK;
-            } else {
-                if (byte == (A_TX ^ SET)) state = BCC_OK;
-            }
-
-            if (byte == FLAG) state = FLAG_RCV;
-            else state = START;
+            if (byte == expectedBCC) *state = BCC_OK;
+            else if (byte == FLAG) *state = FLAG_RCV;
+            else *state = START;
             break;   
         case BCC_OK:
-            if (byte == FLAG) state = STOP;
-            else state = START;
+            if (byte == FLAG) *state = STOP;
+            else *state = START;
             break;
         case STOP: 
             break;
@@ -155,7 +146,7 @@ int llOpenTx(LinkLayer llParameters) {
                 continue;
 
             // printf("Tx received byte = 0x%02X\n", byte);
-            frameStateHandler(TRANSMITTER, byte, state);
+            frameStateHandler(TRANSMITTER, byte, &state);
             
             nBytesBuf += bytes;   
         }
@@ -216,7 +207,7 @@ int llOpenRx(LinkLayer llParameters)
             continue;
 
         // printf("Rx received byte = 0x%02X\n", byte);
-        frameStateHandler(RECEIVER, byte, state);
+        frameStateHandler(RECEIVER, byte, &state);
 
     }
 
