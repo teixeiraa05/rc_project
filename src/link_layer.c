@@ -38,19 +38,18 @@ typedef enum {
 typedef enum {
     TRANSMITTER,
     RECEIVER
-} Machine;
+} Role;
 
 static void alarmHandler(int signal) {
     alarmEnabled = FALSE;
     alarmCount++;
 }
 
-void frameStateHandler(Machine m, unsigned char byte, State *state) {
+void frameStateHandler(Role role, unsigned char byte, State *state) {
 
-    unsigned char expectedA = (m == TRANSMITTER) ? A_RX : A_TX;
-    unsigned char expectedC = (m == TRANSMITTER) ? UA : SET;
-    unsigned char expectedBCC = (m == TRANSMITTER) ? (A_RX ^ UA) : (A_TX ^ SET);
-
+    unsigned char expectedA = (role == TRANSMITTER) ? A_RX : A_TX;
+    unsigned char expectedC = (role == TRANSMITTER) ? UA : SET;
+    unsigned char expectedBCC = (role == TRANSMITTER) ? (A_RX ^ UA) : (A_TX ^ SET);
 
     switch (*state)
     {
@@ -154,12 +153,12 @@ int llOpenTx(LinkLayer llParameters) {
         alarmEnabled = FALSE;
         alarm(0);
         if (state == STOP) {
-            if (closeSerialPort() < 0) {
-                perror("closeSerialPort");
-                return -1;
-            }
+            // if (closeSerialPort() < 0) {
+            //     perror("closeSerialPort");
+            //     return -1;
+            // }
 
-            printf("Serial port %s closed\n", llParameters.serialPort);
+            // printf("Serial port %s closed\n", llParameters.serialPort);
             return 0;
         }
     }
@@ -226,13 +225,13 @@ int llOpenRx(LinkLayer llParameters)
     printf("SET received; UA sent\n");
 
     // Close serial port
-    if (closeSerialPort() < 0)
-    {
-        perror("closeSerialPort");
-        return -1;
-    }
+    // if (closeSerialPort() < 0)
+    // {
+    //     perror("closeSerialPort");
+    //     return -1;
+    // }
 
-    printf("Serial port %s closed\n", llParameters.serialPort);
+    // printf("Serial port %s closed\n", llParameters.serialPort);
 
     return 0;
 }
