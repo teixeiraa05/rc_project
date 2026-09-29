@@ -12,7 +12,7 @@
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
-#define BUF_SIZE 5
+#define SUP_FRAME_SIZE 5
 
 #define TRUE 1
 #define FALSE 0
@@ -35,10 +35,85 @@ typedef enum {
     STOP
 } State; 
 
+typedef enum {
+    TRANSMITTER,
+    RECEIVER
+} Role;
 
 static void alarmHandler(int signal) {
     alarmEnabled = FALSE;
     alarmCount++;
+}
+
+//building the frame to send (SUPERVISION only for now, later DISC) 
+static void buildSupervisionFrame (
+    unsigned char address,
+    unsigned char control, 
+    unsigned char frame[SUP_FRAME_SIZE]
+)  
+{
+    frame[0] = FLAG;
+    frame[1] = address; 
+    frame[2] = control; 
+    frame[3] = address^control;
+    frame[4] = FLAG;
+}
+
+//write all 5 bytes
+static int writeSupervisionFrame (unsigned char address, unsigned char control) {
+    unsigned char frame[SUP_FRAME_SIZE];
+    buildSupervisionFrame(address, control, frame);
+
+    int bytes = writeBytesSerialPort(frame, SUP_FRAME_SIZE);
+    if (bytes != SUP_FRAME_SIZE) {
+        if (bytes < 0) perror("writeBytesSerialPort");
+        else fprintf(stderr, "Incomplete frame written\n");
+        return -1;
+    }
+
+    printf("%d bytes written to serial port\n", bytes);
+    printf("FRAME = 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
+        frame[0], frame[1], frame[2], frame[3], frame[4]);
+
+    
+    return 0; 
+}
+
+
+//for now just pass the role, but later, to include the DISC, we would need to pass the address and the control bytes specifically as arguments
+static void frameParser(Role role, unsigned char byte, State *state) {
+
+    unsigned char expectedA = (role == TRANSMITTER) ? A_RX : A_TX;
+    unsigned char expectedC = (role == TRANSMITTER) ? UA : SET;
+    unsigned char expectedBCC = (role == TRANSMITTER) ? (A_RX ^ UA) : (A_TX ^ SET);
+
+    switch (*state)
+    {
+        case START:
+            if (byte == FLAG) *state = FLAG_RCV;
+            break; 
+        case FLAG_RCV:
+            if (byte == expectedA) *state = A_RCV;
+            else if (byte == FLAG) *state = FLAG_RCV;
+            else *state = START;
+            break;   
+        case A_RCV:
+            if (byte == expectedC) *state = C_RCV;
+            else if (byte == FLAG) *state = FLAG_RCV;
+            else *state = START;
+            break;   
+        case C_RCV:
+            if (byte == expectedBCC) *state = BCC_OK;
+            else if (byte == FLAG) *state = FLAG_RCV;
+            else *state = START;
+            break;   
+        case BCC_OK:
+            if (byte == FLAG) *state = STOP;
+            else *state = START;
+            break;
+        case STOP: 
+            break;
+    }
 }
 
 ////////////////////////////////////////////////    
@@ -54,6 +129,7 @@ int llOpenTx(LinkLayer llParameters) {
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
+    //alarm installation
     struct sigaction act = {0};
     act.sa_handler = &alarmHandler;
     if (sigaction(SIGALRM, &act, NULL) == -1) {
@@ -61,29 +137,18 @@ int llOpenTx(LinkLayer llParameters) {
         closeSerialPort();
         return -1; 
     }
-
-    // Create string to send
-    unsigned char set[BUF_SIZE] = {FLAG, A_TX, SET, A_TX ^ SET, FLAG};
     
     for (int att = 0; att <= llParameters.nRetransmissions; att++) {
 
         State state = START;
-        int nBytesBuf = 0;
 
-        int bytes = writeBytesSerialPort(set, BUF_SIZE);
-        if (bytes != BUF_SIZE) {
-            if (bytes < 0) perror("writeBytesSerialPort");
-            else fprintf(stderr, "Incomplete SET frame written\n");
+        if (writeSupervisionFrame(A_TX, SET) < 0) {
             closeSerialPort();
-            return -1;
+            return -1; 
         }
-        // printf("Tx SET = 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
-        //       set[0], set[1], set[2], set[3], set[4]);
-        
+
         alarmEnabled = TRUE;
         alarm(llParameters.timeout); 
-
-        printf("%d bytes written to serial port\n", bytes);
         
         while (state != STOP && alarmEnabled) {
             unsigned char byte;
@@ -105,50 +170,23 @@ int llOpenTx(LinkLayer llParameters) {
                 continue;
 
             // printf("Tx received byte = 0x%02X\n", byte);
-            switch (state)
-            {
-                case START:
-                    if (byte == FLAG) state = FLAG_RCV;
-                    break; 
-                case FLAG_RCV:
-                    if (byte == A_RX) state = A_RCV;
-                    else if (byte != FLAG) state = START;
-                    break;
-                case A_RCV:
-                    if (byte == UA) state = C_RCV;
-                    else if (byte == FLAG) state = FLAG_RCV;
-                    else state = START;
-                    break;
-                case C_RCV:
-                    if (byte == (A_RX ^ UA)) state = BCC_OK;
-                    else if (byte == FLAG) state = FLAG_RCV;
-                    else state = START;
-                    break; 
-                case BCC_OK:
-                    if (byte == FLAG) state = STOP;
-                    else state = START;
-                    break;
-                case STOP: 
-                    break;
-            }
-            
-            nBytesBuf += bytes;   
+            frameParser(TRANSMITTER, byte, &state);
         }
 
         alarmEnabled = FALSE;
         alarm(0);
         if (state == STOP) {
-            if (closeSerialPort() < 0) {
-                perror("closeSerialPort");
-                return -1;
-            }
+            // if (closeSerialPort() < 0) {
+            //     perror("closeSerialPort");
+            //     return -1;
+            // }
 
-            printf("Serial port %s closed\n", llParameters.serialPort);
+            // printf("Serial port %s closed\n", llParameters.serialPort);
             return 0;
         }
     }
     
-    // Close serial port
+    // Close serial port on exceeding the limit of retransmissions
     if (closeSerialPort() < 0)
     {
         perror("closeSerialPort");
@@ -162,11 +200,6 @@ int llOpenTx(LinkLayer llParameters) {
 
 int llOpenRx(LinkLayer llParameters)
 {
-    // ----------------------------------------------------
-    // This example code shows how to open the serial port and receive a string.
-    // TODO: Adapt and extend this code according to the specifications of the project.
-    // ----------------------------------------------------
-
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
     {
         perror("openSerialPort");
@@ -191,56 +224,25 @@ int llOpenRx(LinkLayer llParameters)
             continue;
 
         // printf("Rx received byte = 0x%02X\n", byte);
-        switch (state)
-        {
-        case START:
-            if (byte == FLAG) state = FLAG_RCV;
-            break;
-        case FLAG_RCV:
-            if (byte == A_TX) state = A_RCV;
-            else if (byte != FLAG) state = START;
-            break;
-        case A_RCV:
-            if (byte == SET) state = C_RCV;
-            else if (byte == FLAG) state = FLAG_RCV;
-            else state = START;
-            break;
-        case C_RCV:
-            if (byte == (A_TX ^ SET)) state = BCC_OK;
-            else if (byte == FLAG) state = FLAG_RCV;
-            else state = START;
-            break;
-        case BCC_OK:
-            if (byte == FLAG) state = STOP;
-            else state = START;
-            break;
-        case STOP:
-            break;
-        }
-    }
+        frameParser(RECEIVER, byte, &state);
 
-    unsigned char ua[BUF_SIZE] = {FLAG, A_RX, UA, A_RX ^ UA, FLAG};
-    // printf("Rx UA = 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
-    //           ua[0], ua[1], ua[2], ua[3], ua[4]);
+    }    
 
-    int bytes = writeBytesSerialPort(ua, BUF_SIZE);
-    if (bytes < 0)
-    {
-        perror("writeBytesSerialPort");
+    if(writeSupervisionFrame(A_RX, UA) < 0) {
         closeSerialPort();
-        return -1;
+        return -1; 
     }
 
     printf("SET received; UA sent\n");
 
     // Close serial port
-    if (closeSerialPort() < 0)
-    {
-        perror("closeSerialPort");
-        return -1;
-    }
+    // if (closeSerialPort() < 0)
+    // {
+    //     perror("closeSerialPort");
+    //     return -1;
+    // }
 
-    printf("Serial port %s closed\n", llParameters.serialPort);
+    // printf("Serial port %s closed\n", llParameters.serialPort);
 
     return 0;
 }
