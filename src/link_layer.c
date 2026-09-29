@@ -35,10 +35,59 @@ typedef enum {
     STOP
 } State; 
 
+typedef enum {
+    TRANSMITTER,
+    RECEIVER
+} Machine;
 
 static void alarmHandler(int signal) {
     alarmEnabled = FALSE;
     alarmCount++;
+}
+
+void frameStateHandler(Machine m, unsigned char byte, State state) {
+    switch (state)
+    {
+        case START:
+            if (byte == FLAG) state = FLAG_RCV;
+            break; 
+        case FLAG_RCV:
+            if (m == TRANSMITTER) {
+                if (byte == A_RX) state = A_RCV;
+            } else {
+                if (byte == A_TX) state = A_RCV;
+            }
+
+            if (byte == FLAG) state = FLAG_RCV;
+            else state = START;
+            break;   
+        case A_RCV:
+            if (m == TRANSMITTER) {
+                if (byte == UA) state = C_RCV;
+            } else {
+                if (byte == SET) state = C_RCV;
+            }
+
+            if (byte == FLAG) state = FLAG_RCV;
+            else state = START;
+            break;   
+        case C_RCV:
+            if (m == TRANSMITTER) {
+                if (byte == (A_RX ^ UA)) state = BCC_OK;
+            } else {
+                if (byte == (A_TX ^ SET)) state = BCC_OK;
+            }
+
+            if (byte == FLAG) state = FLAG_RCV;
+            else state = START;
+            break;   
+        case BCC_OK:
+            if (byte == FLAG) state = STOP;
+            else state = START;
+            break;
+        case STOP: 
+            break;
+    }
 }
 
 ////////////////////////////////////////////////    
@@ -54,6 +103,7 @@ int llOpenTx(LinkLayer llParameters) {
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
+    //alarm installation
     struct sigaction act = {0};
     act.sa_handler = &alarmHandler;
     if (sigaction(SIGALRM, &act, NULL) == -1) {
@@ -63,7 +113,7 @@ int llOpenTx(LinkLayer llParameters) {
     }
 
     // Create string to send
-    unsigned char set[BUF_SIZE] = {FLAG, A_TX, SET, A_TX ^ SET, FLAG};
+    unsigned char set[BUF_SIZE] = {FLAG, A_TX, SET, A_TX ^ SET, FLAG};  
     
     for (int att = 0; att <= llParameters.nRetransmissions; att++) {
 
@@ -105,32 +155,7 @@ int llOpenTx(LinkLayer llParameters) {
                 continue;
 
             // printf("Tx received byte = 0x%02X\n", byte);
-            switch (state)
-            {
-                case START:
-                    if (byte == FLAG) state = FLAG_RCV;
-                    break; 
-                case FLAG_RCV:
-                    if (byte == A_RX) state = A_RCV;
-                    else if (byte != FLAG) state = START;
-                    break;
-                case A_RCV:
-                    if (byte == UA) state = C_RCV;
-                    else if (byte == FLAG) state = FLAG_RCV;
-                    else state = START;
-                    break;
-                case C_RCV:
-                    if (byte == (A_RX ^ UA)) state = BCC_OK;
-                    else if (byte == FLAG) state = FLAG_RCV;
-                    else state = START;
-                    break; 
-                case BCC_OK:
-                    if (byte == FLAG) state = STOP;
-                    else state = START;
-                    break;
-                case STOP: 
-                    break;
-            }
+            frameStateHandler(TRANSMITTER, byte, state);
             
             nBytesBuf += bytes;   
         }
@@ -191,32 +216,8 @@ int llOpenRx(LinkLayer llParameters)
             continue;
 
         // printf("Rx received byte = 0x%02X\n", byte);
-        switch (state)
-        {
-        case START:
-            if (byte == FLAG) state = FLAG_RCV;
-            break;
-        case FLAG_RCV:
-            if (byte == A_TX) state = A_RCV;
-            else if (byte != FLAG) state = START;
-            break;
-        case A_RCV:
-            if (byte == SET) state = C_RCV;
-            else if (byte == FLAG) state = FLAG_RCV;
-            else state = START;
-            break;
-        case C_RCV:
-            if (byte == (A_TX ^ SET)) state = BCC_OK;
-            else if (byte == FLAG) state = FLAG_RCV;
-            else state = START;
-            break;
-        case BCC_OK:
-            if (byte == FLAG) state = STOP;
-            else state = START;
-            break;
-        case STOP:
-            break;
-        }
+        frameStateHandler(RECEIVER, byte, state);
+
     }
 
     unsigned char ua[BUF_SIZE] = {FLAG, A_RX, UA, A_RX ^ UA, FLAG};
