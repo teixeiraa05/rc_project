@@ -18,10 +18,23 @@
 #define FALSE 0
 
 #define FLAG 0x7E
+
 #define A_TX 0x03
 #define A_RX 0x01
+
 #define SET 0x03
 #define UA 0x07
+#define RR0 0xAA
+#define RR1 0xAB
+#define REJ0 0x54
+#define REJ1 0x55
+#define DISC 0x0B
+#define I0 0x00
+#define I1 0x80
+
+#define ESC 0x7D
+#define FLAG_R FLAG^0x20
+#define ESC_R ESC^0x20  
 
 static int alarmEnabled = FALSE;
 static int alarmCount = 0; 
@@ -32,6 +45,8 @@ typedef enum {
     A_RCV,
     C_RCV,
     BCC_OK,
+    BCC2_OK,
+    DATA_RCV,
     STOP
 } State; 
 
@@ -81,7 +96,7 @@ static int writeSupervisionFrame (unsigned char address, unsigned char control) 
 
 
 //for now just pass the role, but later, to include the DISC, we would need to pass the address and the control bytes specifically as arguments
-static void frameParser(Role role, unsigned char byte, State *state) {
+static void supervisionFrameParser(Role role, unsigned char byte, State *state) {
 
     unsigned char expectedA = (role == TRANSMITTER) ? A_RX : A_TX;
     unsigned char expectedC = (role == TRANSMITTER) ? UA : SET;
@@ -114,6 +129,11 @@ static void frameParser(Role role, unsigned char byte, State *state) {
         case STOP: 
             break;
     }
+}
+
+static void dataFrameParser (unsigned char byte, State *state) {
+    //TODO
+    return;
 }
 
 ////////////////////////////////////////////////    
@@ -170,7 +190,7 @@ int llOpenTx(LinkLayer llParameters) {
                 continue;
 
             // printf("Tx received byte = 0x%02X\n", byte);
-            frameParser(TRANSMITTER, byte, &state);
+            supervisionFrameParser(TRANSMITTER, byte, &state);
         }
 
         alarmEnabled = FALSE;
@@ -224,7 +244,7 @@ int llOpenRx(LinkLayer llParameters)
             continue;
 
         // printf("Rx received byte = 0x%02X\n", byte);
-        frameParser(RECEIVER, byte, &state);
+        supervisionFrameParser(RECEIVER, byte, &state);
 
     }    
 
@@ -247,12 +267,51 @@ int llOpenRx(LinkLayer llParameters)
     return 0;
 }
 
+//methods to do byte (de-)stuffing
+int stuffByte (unsigned char byte, unsigned char *output) {
+    if (byte == FLAG) {
+        output[0] = ESC;
+        output[1] = FLAG_R;
+        return 2;
+    } else if (byte == ESC) {
+        output[0] = ESC;
+        output[1] = ESC_R;
+        return 2; 
+    }
+
+    output[0] = byte;
+    return 1;
+}
+
+int destuffByte(unsigned char byte, unsigned char *output, int *escaped) {
+    if (*escaped)
+    {
+        *output = byte ^ 0x20;
+        *escaped = 0;
+        return 1;
+    }
+
+    if (byte == ESC)
+    {
+        *escaped = 1;
+        return 0;
+    }
+
+    *output = byte;
+    return 1;
+}
+
+
 ////////////////////////////////////////////////
 // LLSEND
 ////////////////////////////////////////////////
 int llSend(const unsigned char *buf, int bufSize)
 {
-    // TODO: Implement this function
+    State state = START;
+
+    
+    
+
 
     return 0;
 }
