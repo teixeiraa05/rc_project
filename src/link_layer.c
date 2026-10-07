@@ -33,8 +33,8 @@
 #define I1 0x80
 
 #define ESC 0x7D
-#define FLAG_R FLAG^0x20
-#define ESC_R ESC^0x20  
+#define ESCAPED_FLAG (FLAG ^ 0x20)
+#define ESCAPED_ESCAPED (ESC ^ 0x20)
 
 static int alarmEnabled = FALSE;
 static int alarmCount = 0; 
@@ -49,6 +49,18 @@ typedef enum {
     DATA_RCV,
     STOP
 } State; 
+
+// Values that must survive between calls to the information-frame parser.
+typedef struct {
+    State state;
+    unsigned char control;
+    unsigned char data[MAX_PAYLOAD_SIZE + 1];
+    int dataLength;
+    // XOR of all destuffed body bytes, including the received BCC2.
+    unsigned char bcc2;
+    int valid;
+    int escaped;
+} FrameParserState;
 
 typedef enum {
     TRANSMITTER,
@@ -131,9 +143,114 @@ static void supervisionFrameParser(Role role, unsigned char byte, State *state) 
     }
 }
 
-static void dataFrameParser (unsigned char byte, State *state) {
-    //TODO
-    return;
+//methods to do byte (de-)stuffing
+int stuffByte (unsigned char byte, unsigned char *output) {
+    if (byte == FLAG) {
+        output[0] = ESC;
+        output[1] = ESCAPED_FLAG;
+        return 2;
+    } else if (byte == ESC) {
+        output[0] = ESC;
+        output[1] = ESCAPED_ESCAPED;
+        return 2; 
+    }
+
+    output[0] = byte;
+    return 1;
+}
+
+// Returns 1 for a decoded byte, 0 for ESC, or -1 for an invalid escape.
+int destuffByte(unsigned char byte, unsigned char *output, int *escaped) {
+    if (*escaped)
+    {
+        *escaped = 0;
+        if (byte != ESCAPED_FLAG && byte != ESCAPED_ESCAPED)
+            return -1;
+        *output = byte ^ 0x20;
+        return 1;
+    }
+
+    if (byte == ESC)
+    {
+        *escaped = 1;
+        return 0;
+    }
+
+    *output = byte;
+    return 1;
+}
+
+static void iFrameParser (unsigned char byte, FrameParserState *parser) {
+    State *state = &parser->state;
+    unsigned char decoded;
+
+    switch (*state)
+    {
+        case START:
+            if (byte == FLAG) *state = FLAG_RCV;
+            break; 
+        case FLAG_RCV:
+            if (byte == A_TX) *state = A_RCV;
+            else if (byte == FLAG) *state = FLAG_RCV;
+            else *state = START;
+            break;   
+        case A_RCV:
+            if (byte == I0 || byte == I1) {
+                parser->control = byte;
+                *state = C_RCV;
+            }
+            else if (byte == FLAG) *state = FLAG_RCV;
+            else *state = START;
+            break;   
+        case C_RCV:
+            if (byte == (A_TX ^ parser->control)) {
+                parser->dataLength = 0;
+                parser->bcc2 = 0;
+                parser->escaped = FALSE;
+                parser->valid = FALSE;
+                *state = DATA_RCV;
+            }
+            else if (byte == FLAG) *state = FLAG_RCV;
+            else *state = START;
+            break;   
+        case DATA_RCV: {
+            if (byte == FLAG && !parser->escaped) {
+                parser->valid = parser->dataLength >= 1 && parser->bcc2 == 0;
+                if (parser->valid)
+                    parser->dataLength--; // Exclude BCC2 from the payload length.
+                else
+                    fprintf(stderr, "[ERROR] Invalid BCC2\n");
+                *state = STOP;
+                break;
+            }
+
+            int result = destuffByte(byte, &decoded, &parser->escaped);
+            if (result == 0) break; // Wait for the byte following ESC.
+            if (result < 0) {
+                parser->valid = FALSE;
+                fprintf(stderr, "[ERROR] Invalid escape sequence\n");
+                *state = STOP;
+                break;
+            }
+
+            if (parser->dataLength >= (int) sizeof(parser->data)) {
+                parser->valid = FALSE;
+                fprintf(stderr, "[ERROR] Oversized frame\n");
+                *state = STOP;
+                break;
+            }
+
+            parser->data[parser->dataLength++] = decoded;
+            parser->bcc2 ^= decoded;
+            break;
+        }
+        case STOP: 
+            break;
+        default:
+            parser->valid = FALSE;
+            *state = START;
+            break;
+    }
 }
 
 ////////////////////////////////////////////////    
@@ -267,41 +384,6 @@ int llOpenRx(LinkLayer llParameters)
     return 0;
 }
 
-//methods to do byte (de-)stuffing
-int stuffByte (unsigned char byte, unsigned char *output) {
-    if (byte == FLAG) {
-        output[0] = ESC;
-        output[1] = FLAG_R;
-        return 2;
-    } else if (byte == ESC) {
-        output[0] = ESC;
-        output[1] = ESC_R;
-        return 2; 
-    }
-
-    output[0] = byte;
-    return 1;
-}
-
-int destuffByte(unsigned char byte, unsigned char *output, int *escaped) {
-    if (*escaped)
-    {
-        *output = byte ^ 0x20;
-        *escaped = 0;
-        return 1;
-    }
-
-    if (byte == ESC)
-    {
-        *escaped = 1;
-        return 0;
-    }
-
-    *output = byte;
-    return 1;
-}
-
-
 ////////////////////////////////////////////////
 // LLSEND
 ////////////////////////////////////////////////
@@ -319,9 +401,12 @@ int llSend(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 // LLRECEIVE
 ////////////////////////////////////////////////
-int llReceive(unsigned char *packet)
-{
-    // TODO: Implement this function
+int llReceive(unsigned char *packet) {
+
+    FrameParserState parser = {parser.state = START};
+    unsigned int nrRetransmissions = 0;
+    
+
 
     return 0;
 }
