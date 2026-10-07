@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <string.h>
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
@@ -36,6 +37,8 @@
 #define ESCAPED_FLAG (FLAG ^ 0x20)
 #define ESCAPED_ESCAPED (ESC ^ 0x20)
 
+static int expectedSequence = 0; 
+
 static int alarmEnabled = FALSE;
 static int alarmCount = 0; 
 
@@ -47,6 +50,7 @@ typedef enum {
     BCC_OK,
     BCC2_OK,
     DATA_RCV,
+    DISCARD_DATA,
     STOP
 } State; 
 
@@ -229,14 +233,15 @@ static void iFrameParser (unsigned char byte, FrameParserState *parser) {
             if (result < 0) {
                 parser->valid = FALSE;
                 fprintf(stderr, "[ERROR] Invalid escape sequence\n");
-                *state = STOP;
+                // A raw flag already ends the damaged frame.
+                *state = byte == FLAG ? STOP : DISCARD_DATA;
                 break;
             }
 
             if (parser->dataLength >= (int) sizeof(parser->data)) {
                 parser->valid = FALSE;
                 fprintf(stderr, "[ERROR] Oversized frame\n");
-                *state = STOP;
+                *state = DISCARD_DATA;
                 break;
             }
 
@@ -244,6 +249,10 @@ static void iFrameParser (unsigned char byte, FrameParserState *parser) {
             parser->bcc2 ^= decoded;
             break;
         }
+        case DISCARD_DATA:
+            // Drain the damaged body before asking for retransmission.
+            if (byte == FLAG) *state = STOP;
+            break;
         case STOP: 
             break;
         default:
@@ -371,6 +380,7 @@ int llOpenRx(LinkLayer llParameters)
     }
 
     printf("SET received; UA sent\n");
+    expectedSequence = 0;
 
     // Close serial port
     // if (closeSerialPort() < 0)
@@ -402,13 +412,41 @@ int llSend(const unsigned char *buf, int bufSize)
 // LLRECEIVE
 ////////////////////////////////////////////////
 int llReceive(unsigned char *packet) {
+    while (TRUE) {
+        FrameParserState parser = {.state = START};
 
-    FrameParserState parser = {parser.state = START};
-    unsigned int nrRetransmissions = 0;
-    
+        while (parser.state != STOP) {
+            unsigned char byte;
+            int bytes = readByteSerialPort(&byte);
 
+            if (bytes < 0) {
+                if (errno == EINTR) continue;
+                perror("readByteSerialPort");
+                return -1;
+            }
+            if (bytes == 0) continue;
+            iFrameParser(byte, &parser);
+        }
 
-    return 0;
+        if (!parser.valid) {
+            unsigned char rej = expectedSequence == 0 ? REJ0 : REJ1;
+            if (writeSupervisionFrame(A_RX, rej) < 0) return -1;
+            continue;
+        }
+
+        int receivedSequence = parser.control == I1;
+        int isNew = receivedSequence == expectedSequence;
+        int nextExpected = isNew ? (expectedSequence ^ 1) : expectedSequence;
+        unsigned char rr = nextExpected == 0 ? RR0 : RR1;
+        if (writeSupervisionFrame(A_RX, rr) < 0) return -1;
+
+        // Acknowledge duplicates without delivering the payload twice.
+        if (!isNew) continue;
+
+        expectedSequence = nextExpected;
+        memcpy(packet, parser.data, parser.dataLength);
+        return parser.dataLength;
+    }
 }
 
 ////////////////////////////////////////////////
