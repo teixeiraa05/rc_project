@@ -2,6 +2,8 @@
 //
 // Link layer protocol implementation
 
+#define _POSIX_SOURCE 1 // POSIX compliant source (must come before the includes)
+
 #include "link_layer.h"
 #include "serial_port.h"
 
@@ -12,7 +14,6 @@
 #include <string.h>
 
 // MISC
-#define _POSIX_SOURCE 1 // POSIX compliant source
 #define SUP_FRAME_SIZE 5
 
 #define TRUE 1
@@ -37,10 +38,14 @@
 #define ESCAPED_FLAG (FLAG ^ 0x20)
 #define ESCAPED_ESCAPED (ESC ^ 0x20)
 
-static int expectedSequence = 0; 
+static int expectedSequence = 0;
 
 static int alarmEnabled = FALSE;
-static int alarmCount = 0; 
+static int alarmCount = 0;
+
+static int txSequence = 0;
+static int savedTimeout = 0;
+static int savedRetries = 0;
 
 typedef enum {
     START,
@@ -52,7 +57,7 @@ typedef enum {
     DATA_RCV,
     DISCARD_DATA,
     STOP
-} State; 
+} State;
 
 // Values that must survive between calls to the information-frame parser.
 typedef struct {
@@ -76,22 +81,21 @@ static void alarmHandler(int signal) {
     alarmCount++;
 }
 
-//building the frame to send (SUPERVISION only for now, later DISC) 
-static void buildSupervisionFrame (
+// Building the frame to send (supervision frames: SET, UA, RR, REJ, DISC)
+static void buildSupervisionFrame(
     unsigned char address,
-    unsigned char control, 
-    unsigned char frame[SUP_FRAME_SIZE]
-)  
+    unsigned char control,
+    unsigned char frame[SUP_FRAME_SIZE])
 {
     frame[0] = FLAG;
-    frame[1] = address; 
-    frame[2] = control; 
-    frame[3] = address^control;
+    frame[1] = address;
+    frame[2] = control;
+    frame[3] = address ^ control;
     frame[4] = FLAG;
 }
 
-//write all 5 bytes
-static int writeSupervisionFrame (unsigned char address, unsigned char control) {
+// Write all 5 bytes
+static int writeSupervisionFrame(unsigned char address, unsigned char control) {
     unsigned char frame[SUP_FRAME_SIZE];
     buildSupervisionFrame(address, control, frame);
 
@@ -106,12 +110,10 @@ static int writeSupervisionFrame (unsigned char address, unsigned char control) 
     printf("FRAME = 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
         frame[0], frame[1], frame[2], frame[3], frame[4]);
 
-    
-    return 0; 
+    return 0;
 }
 
-
-//for now just pass the role, but later, to include the DISC, we would need to pass the address and the control bytes specifically as arguments
+// For now just pass the role (used for SET/UA during llopen)
 static void supervisionFrameParser(Role role, unsigned char byte, State *state) {
 
     unsigned char expectedA = (role == TRANSMITTER) ? A_RX : A_TX;
@@ -122,33 +124,33 @@ static void supervisionFrameParser(Role role, unsigned char byte, State *state) 
     {
         case START:
             if (byte == FLAG) *state = FLAG_RCV;
-            break; 
+            break;
         case FLAG_RCV:
             if (byte == expectedA) *state = A_RCV;
             else if (byte == FLAG) *state = FLAG_RCV;
             else *state = START;
-            break;   
+            break;
         case A_RCV:
             if (byte == expectedC) *state = C_RCV;
             else if (byte == FLAG) *state = FLAG_RCV;
             else *state = START;
-            break;   
+            break;
         case C_RCV:
             if (byte == expectedBCC) *state = BCC_OK;
             else if (byte == FLAG) *state = FLAG_RCV;
             else *state = START;
-            break;   
+            break;
         case BCC_OK:
             if (byte == FLAG) *state = STOP;
             else *state = START;
             break;
-        case STOP: 
+        default:
             break;
     }
 }
 
-//methods to do byte (de-)stuffing
-int stuffByte (unsigned char byte, unsigned char *output) {
+// Byte (de-)stuffing
+static int stuffByte(unsigned char byte, unsigned char *output) {
     if (byte == FLAG) {
         output[0] = ESC;
         output[1] = ESCAPED_FLAG;
@@ -156,7 +158,7 @@ int stuffByte (unsigned char byte, unsigned char *output) {
     } else if (byte == ESC) {
         output[0] = ESC;
         output[1] = ESCAPED_ESCAPED;
-        return 2; 
+        return 2;
     }
 
     output[0] = byte;
@@ -164,7 +166,7 @@ int stuffByte (unsigned char byte, unsigned char *output) {
 }
 
 // Returns 1 for a decoded byte, 0 for ESC, or -1 for an invalid escape.
-int destuffByte(unsigned char byte, unsigned char *output, int *escaped) {
+static int destuffByte(unsigned char byte, unsigned char *output, int *escaped) {
     if (*escaped)
     {
         *escaped = 0;
@@ -184,7 +186,9 @@ int destuffByte(unsigned char byte, unsigned char *output, int *escaped) {
     return 1;
 }
 
-static void iFrameParser (unsigned char byte, FrameParserState *parser) {
+// Parses I-frames. Also recognises a retransmitted SET (lost UA), which has
+// no body: it goes C_RCV -> BCC_OK -> STOP with valid = TRUE.
+static void iFrameParser(unsigned char byte, FrameParserState *parser) {
     State *state = &parser->state;
     unsigned char decoded;
 
@@ -192,31 +196,43 @@ static void iFrameParser (unsigned char byte, FrameParserState *parser) {
     {
         case START:
             if (byte == FLAG) *state = FLAG_RCV;
-            break; 
+            break;
         case FLAG_RCV:
             if (byte == A_TX) *state = A_RCV;
             else if (byte == FLAG) *state = FLAG_RCV;
             else *state = START;
-            break;   
+            break;
         case A_RCV:
-            if (byte == I0 || byte == I1) {
+            if (byte == I0 || byte == I1 || byte == SET) {
                 parser->control = byte;
                 *state = C_RCV;
             }
             else if (byte == FLAG) *state = FLAG_RCV;
             else *state = START;
-            break;   
+            break;
         case C_RCV:
             if (byte == (A_TX ^ parser->control)) {
+                parser->valid = FALSE;
+                if (parser->control == SET) {
+                    *state = BCC_OK;
+                    break;
+                }
                 parser->dataLength = 0;
                 parser->bcc2 = 0;
                 parser->escaped = FALSE;
-                parser->valid = FALSE;
                 *state = DATA_RCV;
             }
             else if (byte == FLAG) *state = FLAG_RCV;
             else *state = START;
-            break;   
+            break;
+        case BCC_OK:
+            // Only reached for SET frames.
+            if (byte == FLAG) {
+                parser->valid = TRUE;
+                *state = STOP;
+            }
+            else *state = START;
+            break;
         case DATA_RCV: {
             if (byte == FLAG && !parser->escaped) {
                 parser->valid = parser->dataLength >= 1 && parser->bcc2 == 0;
@@ -253,7 +269,7 @@ static void iFrameParser (unsigned char byte, FrameParserState *parser) {
             // Drain the damaged body before asking for retransmission.
             if (byte == FLAG) *state = STOP;
             break;
-        case STOP: 
+        case STOP:
             break;
         default:
             parser->valid = FALSE;
@@ -262,7 +278,42 @@ static void iFrameParser (unsigned char byte, FrameParserState *parser) {
     }
 }
 
-////////////////////////////////////////////////    
+typedef struct {
+    State state;
+    unsigned char control;   // which reply arrived: RR0, RR1, REJ0 or REJ1
+} ResponseParser;
+
+static void responseParser(unsigned char byte, ResponseParser *p) {
+    switch (p->state) {
+        case START:
+            if (byte == FLAG) p->state = FLAG_RCV;
+            break;
+        case FLAG_RCV:
+            if (byte == A_RX) p->state = A_RCV;
+            else if (byte != FLAG) p->state = START;
+            break;
+        case A_RCV:
+            if (byte == RR0 || byte == RR1 || byte == REJ0 || byte == REJ1) {
+                p->control = byte;
+                p->state = C_RCV;
+            }
+            else if (byte == FLAG) p->state = FLAG_RCV;
+            else p->state = START;
+            break;
+        case C_RCV:
+            if (byte == (A_RX ^ p->control)) p->state = BCC_OK;
+            else if (byte == FLAG) p->state = FLAG_RCV;
+            else p->state = START;
+            break;
+        case BCC_OK:
+            p->state = (byte == FLAG) ? STOP : START;
+            break;
+        default:
+            break;
+    }
+}
+
+////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
 int llOpenTx(LinkLayer llParameters) {
@@ -273,29 +324,33 @@ int llOpenTx(LinkLayer llParameters) {
         return -1;
     }
 
+    savedTimeout = llParameters.timeout;
+    savedRetries = llParameters.nRetransmissions;
+    txSequence = 0;
+
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    //alarm installation
+    // Alarm installation
     struct sigaction act = {0};
     act.sa_handler = &alarmHandler;
     if (sigaction(SIGALRM, &act, NULL) == -1) {
         perror("sigaction");
         closeSerialPort();
-        return -1; 
+        return -1;
     }
-    
+
     for (int att = 0; att <= llParameters.nRetransmissions; att++) {
 
         State state = START;
 
         if (writeSupervisionFrame(A_TX, SET) < 0) {
             closeSerialPort();
-            return -1; 
+            return -1;
         }
 
         alarmEnabled = TRUE;
-        alarm(llParameters.timeout); 
-        
+        alarm(llParameters.timeout);
+
         while (state != STOP && alarmEnabled) {
             unsigned char byte;
             int bytes = readByteSerialPort(&byte);
@@ -315,23 +370,15 @@ int llOpenTx(LinkLayer llParameters) {
             if (bytes == 0)
                 continue;
 
-            // printf("Tx received byte = 0x%02X\n", byte);
             supervisionFrameParser(TRANSMITTER, byte, &state);
         }
 
         alarmEnabled = FALSE;
         alarm(0);
-        if (state == STOP) {
-            // if (closeSerialPort() < 0) {
-            //     perror("closeSerialPort");
-            //     return -1;
-            // }
-
-            // printf("Serial port %s closed\n", llParameters.serialPort);
+        if (state == STOP)
             return 0;
-        }
     }
-    
+
     // Close serial port on exceeding the limit of retransmissions
     if (closeSerialPort() < 0)
     {
@@ -369,27 +416,16 @@ int llOpenRx(LinkLayer llParameters)
         if (bytes == 0)
             continue;
 
-        // printf("Rx received byte = 0x%02X\n", byte);
         supervisionFrameParser(RECEIVER, byte, &state);
+    }
 
-    }    
-
-    if(writeSupervisionFrame(A_RX, UA) < 0) {
+    if (writeSupervisionFrame(A_RX, UA) < 0) {
         closeSerialPort();
-        return -1; 
+        return -1;
     }
 
     printf("SET received; UA sent\n");
     expectedSequence = 0;
-
-    // Close serial port
-    // if (closeSerialPort() < 0)
-    // {
-    //     perror("closeSerialPort");
-    //     return -1;
-    // }
-
-    // printf("Serial port %s closed\n", llParameters.serialPort);
 
     return 0;
 }
@@ -399,13 +435,67 @@ int llOpenRx(LinkLayer llParameters)
 ////////////////////////////////////////////////
 int llSend(const unsigned char *buf, int bufSize)
 {
-    State state = START;
+    if (bufSize < 0 || bufSize > MAX_PAYLOAD_SIZE) return -1;
 
-    
-    
+    // Build the frame once; retransmissions reuse it.
+    unsigned char frame[2 * (MAX_PAYLOAD_SIZE + 1) + 6];
+    int n = 0;
+    unsigned char c = (txSequence == 0) ? I0 : I1;
 
+    frame[n++] = FLAG;
+    frame[n++] = A_TX;
+    frame[n++] = c;
+    frame[n++] = A_TX ^ c;
 
-    return 0;
+    unsigned char bcc2 = 0;
+    for (int i = 0; i < bufSize; i++) {
+        bcc2 ^= buf[i];
+        n += stuffByte(buf[i], &frame[n]);
+    }
+    n += stuffByte(bcc2, &frame[n]);   
+    frame[n++] = FLAG;
+
+    unsigned char okResponse = (txSequence == 0) ? RR1 : RR0;
+
+    for (int att = 0; att <= savedRetries; att++) {
+        if (writeBytesSerialPort(frame, n) != n) return -1;
+
+        ResponseParser p = {.state = START};
+        alarmEnabled = TRUE;
+        alarm(savedTimeout);
+
+        while (p.state != STOP && alarmEnabled) {
+            unsigned char byte;
+            int bytes = readByteSerialPort(&byte);
+
+            if (bytes < 0) {
+                if (errno == EINTR) {
+                    if (!alarmEnabled) break;
+                    continue;
+                }
+                alarm(0);
+                alarmEnabled = FALSE;
+                perror("readByteSerialPort");
+                return -1;
+            }
+            if (bytes == 0) continue;
+
+            responseParser(byte, &p);
+        }
+
+        alarm(0);
+        alarmEnabled = FALSE;
+
+        if (p.state != STOP) continue;      // timeout: retransmit
+
+        if (p.control == okResponse) {      // acknowledged
+            txSequence ^= 1;
+            return bufSize;
+        }
+        // REJ or RR for the same frame: loop and retransmit
+    }
+
+    return -1;                              // too many retransmissions
 }
 
 ////////////////////////////////////////////////
@@ -426,6 +516,11 @@ int llReceive(unsigned char *packet) {
             }
             if (bytes == 0) continue;
             iFrameParser(byte, &parser);
+        }
+
+        if (parser.control == SET) {
+            if (writeSupervisionFrame(A_RX, UA) < 0) return -1;
+            continue;
         }
 
         if (!parser.valid) {
