@@ -70,11 +70,6 @@ typedef struct {
     int escaped;
 } FrameParserState;
 
-typedef enum {
-    TRANSMITTER,
-    RECEIVER
-} Role;
-
 static void alarmHandler(int signal) {
     alarmEnabled = FALSE;
     alarmCount++;
@@ -181,12 +176,57 @@ static int destuffByte(unsigned char byte, unsigned char *output, int *escaped) 
     *output = byte;
     return 1;
 }
+/*
+  Process one information-frame body byte: destuff and store data, accumulate
+  its XOR checksum, and validate BCC2 when the closing flag arrives.
+  Update the parser state to finish the frame or discard a malformed body.
+*/
+static void parseInfoBodyByte(unsigned char byte, FrameParserState *parser) {
+    unsigned char decoded;
+    // An unescaped flag ends the body; payload XOR received BCC2 must be zero.
+    if (byte == FLAG && !parser->escaped) {
+        parser->valid = (parser->dataLength >= 1 && parser->bcc2 == 0);
+        // On success, remove the received checksum byte from the payload length.
+        if (parser->valid)
+            parser->dataLength--; // Exclude BCC2 from the payload length.
+        // Otherwise, report a missing checksum or a nonzero body XOR.
+        else
+            fprintf(stderr, "[ERROR] Invalid BCC2\n");
+        parser->state = STOP;
+        return;
+    }
+
+    int result = destuffByte(byte, &decoded, &parser->escaped);
+
+    // ESC produces no decoded byte yet; wait for the next input byte.
+    if (result == 0) return; // Wait for the byte following ESC.
+
+    // Reject an invalid escape and drain the body unless this byte ends it.
+    if (result < 0) {
+        parser->valid = FALSE;
+        fprintf(stderr, "[ERROR] Invalid escape sequence\n");
+        // A raw flag already ends the damaged frame.
+        parser->state = byte == FLAG ? STOP : DISCARD_DATA;
+        return;
+    }
+
+    // Reserve storage for at most MAX_PAYLOAD_SIZE data bytes plus one BCC2.
+    if (parser->dataLength >= (int) sizeof(parser->data)) {
+        parser->valid = FALSE;
+        fprintf(stderr, "[ERROR] Oversized frame\n");
+        parser->state = DISCARD_DATA;
+        return;
+    }
+
+    // Store each decoded byte, including BCC2, and accumulate the body XOR.
+    parser->data[parser->dataLength++] = decoded;
+    parser->bcc2 ^= decoded;
+}
 
 // Parses I-frames. Also recognises a retransmitted SET (lost UA), which has
 // no body: it goes C_RCV -> BCC_OK -> STOP with valid = TRUE.
 static void iFrameParser(unsigned char byte, FrameParserState *parser) {
     State *state = &parser->state;
-    unsigned char decoded;
 
     switch (*state)
     {
@@ -229,38 +269,9 @@ static void iFrameParser(unsigned char byte, FrameParserState *parser) {
             }
             else *state = START;
             break;
-        case DATA_RCV: {
-            if (byte == FLAG && !parser->escaped) {
-                parser->valid = parser->dataLength >= 1 && parser->bcc2 == 0;
-                if (parser->valid)
-                    parser->dataLength--; // Exclude BCC2 from the payload length.
-                else
-                    fprintf(stderr, "[ERROR] Invalid BCC2\n");
-                *state = STOP;
-                break;
-            }
-
-            int result = destuffByte(byte, &decoded, &parser->escaped);
-            if (result == 0) break; // Wait for the byte following ESC.
-            if (result < 0) {
-                parser->valid = FALSE;
-                fprintf(stderr, "[ERROR] Invalid escape sequence\n");
-                // A raw flag already ends the damaged frame.
-                *state = byte == FLAG ? STOP : DISCARD_DATA;
-                break;
-            }
-
-            if (parser->dataLength >= (int) sizeof(parser->data)) {
-                parser->valid = FALSE;
-                fprintf(stderr, "[ERROR] Oversized frame\n");
-                *state = DISCARD_DATA;
-                break;
-            }
-
-            parser->data[parser->dataLength++] = decoded;
-            parser->bcc2 ^= decoded;
-            break;
-        }
+        case DATA_RCV: 
+            parseInfoBodyByte(byte, parser);
+            break; 
         case DISCARD_DATA:
             // Drain the damaged body before asking for retransmission.
             if (byte == FLAG) *state = STOP;
