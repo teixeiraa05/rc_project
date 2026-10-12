@@ -2,8 +2,6 @@
 //
 // Link layer protocol implementation
 
-#define _POSIX_SOURCE 1 // POSIX compliant source (must come before the includes)
-
 #include "link_layer.h"
 #include "serial_port.h"
 
@@ -14,6 +12,7 @@
 #include <string.h>
 
 // MISC
+#define _POSIX_SOURCE 1
 #define SUP_FRAME_SIZE 5
 
 #define TRUE 1
@@ -21,8 +20,8 @@
 
 #define FLAG 0x7E
 
-#define A_TX 0x03
-#define A_RX 0x01
+#define A_TX 0x03 //commands sent by Tx or replies sent by Rx
+#define A_RX 0x01 //commands sent by Rx or replies sent by Tx
 
 #define SET 0x03
 #define UA 0x07
@@ -38,11 +37,11 @@
 #define ESCAPED_FLAG (FLAG ^ 0x20)
 #define ESCAPED_ESCAPED (ESC ^ 0x20)
 
-static int expectedSequence = 0;
 
 static int alarmEnabled = FALSE;
 static int alarmCount = 0;
 
+static int rxSequence = 0;
 static int txSequence = 0;
 static int savedTimeout = 0;
 static int savedRetries = 0;
@@ -114,11 +113,8 @@ static int writeSupervisionFrame(unsigned char address, unsigned char control) {
 }
 
 // For now just pass the role (used for SET/UA during llopen)
-static void supervisionFrameParser(Role role, unsigned char byte, State *state) {
-
-    unsigned char expectedA = (role == TRANSMITTER) ? A_RX : A_TX;
-    unsigned char expectedC = (role == TRANSMITTER) ? UA : SET;
-    unsigned char expectedBCC = (role == TRANSMITTER) ? (A_RX ^ UA) : (A_TX ^ SET);
+static void supervisionFrameParser(unsigned char byte, State *state, unsigned char address, unsigned char control) {
+    unsigned char expectedBCC = address ^ control;
 
     switch (*state)
     {
@@ -126,12 +122,12 @@ static void supervisionFrameParser(Role role, unsigned char byte, State *state) 
             if (byte == FLAG) *state = FLAG_RCV;
             break;
         case FLAG_RCV:
-            if (byte == expectedA) *state = A_RCV;
+            if (byte == address) *state = A_RCV;
             else if (byte == FLAG) *state = FLAG_RCV;
             else *state = START;
             break;
         case A_RCV:
-            if (byte == expectedC) *state = C_RCV;
+            if (byte == control) *state = C_RCV;
             else if (byte == FLAG) *state = FLAG_RCV;
             else *state = START;
             break;
@@ -149,7 +145,7 @@ static void supervisionFrameParser(Role role, unsigned char byte, State *state) 
     }
 }
 
-// Byte (de-)stuffing
+// Byte stuffing
 static int stuffByte(unsigned char byte, unsigned char *output) {
     if (byte == FLAG) {
         output[0] = ESC;
@@ -165,7 +161,7 @@ static int stuffByte(unsigned char byte, unsigned char *output) {
     return 1;
 }
 
-// Returns 1 for a decoded byte, 0 for ESC, or -1 for an invalid escape.
+//Byte stuffing. Returns 1 for a decoded byte, 0 for ESC, or -1 for an invalid escape.
 static int destuffByte(unsigned char byte, unsigned char *output, int *escaped) {
     if (*escaped)
     {
@@ -370,7 +366,7 @@ int llOpenTx(LinkLayer llParameters) {
             if (bytes == 0)
                 continue;
 
-            supervisionFrameParser(TRANSMITTER, byte, &state);
+            supervisionFrameParser(byte, &state, A_TX, UA);
         }
 
         alarmEnabled = FALSE;
@@ -416,7 +412,7 @@ int llOpenRx(LinkLayer llParameters)
         if (bytes == 0)
             continue;
 
-        supervisionFrameParser(RECEIVER, byte, &state);
+        supervisionFrameParser(byte, &state, A_TX, SET);
     }
 
     if (writeSupervisionFrame(A_RX, UA) < 0) {
@@ -425,7 +421,7 @@ int llOpenRx(LinkLayer llParameters)
     }
 
     printf("SET received; UA sent\n");
-    expectedSequence = 0;
+    rxSequence = 0;
 
     return 0;
 }
@@ -437,17 +433,22 @@ int llSend(const unsigned char *buf, int bufSize)
 {
     if (bufSize < 0 || bufSize > MAX_PAYLOAD_SIZE) return -1;
 
-    // Build the frame once; retransmissions reuse it.
-    unsigned char frame[2 * (MAX_PAYLOAD_SIZE + 1) + 6];
+    /* 
+        Build the frame once; retransmissions reuse it.
+        
+        2 * (MAX_PAYLOAD + 1) for the possible stuffing on every byte (and the BCC2, which might need stuffing)
+        + 5 for the FLAG, address, control, BCC, FLAG 
+    */
+    unsigned char frame[2 * (MAX_PAYLOAD_SIZE + 1) + 5];
     int n = 0;
-    unsigned char c = (txSequence == 0) ? I0 : I1;
+    unsigned char control = (txSequence == 0) ? I0 : I1;
+    unsigned char bcc2 = 0;
 
     frame[n++] = FLAG;
     frame[n++] = A_TX;
-    frame[n++] = c;
-    frame[n++] = A_TX ^ c;
+    frame[n++] = control;
+    frame[n++] = A_TX ^ control;
 
-    unsigned char bcc2 = 0;
     for (int i = 0; i < bufSize; i++) {
         bcc2 ^= buf[i];
         n += stuffByte(buf[i], &frame[n]);
@@ -524,21 +525,21 @@ int llReceive(unsigned char *packet) {
         }
 
         if (!parser.valid) {
-            unsigned char rej = expectedSequence == 0 ? REJ0 : REJ1;
+            unsigned char rej = rxSequence == 0 ? REJ0 : REJ1;
             if (writeSupervisionFrame(A_RX, rej) < 0) return -1;
             continue;
         }
 
         int receivedSequence = parser.control == I1;
-        int isNew = receivedSequence == expectedSequence;
-        int nextExpected = isNew ? (expectedSequence ^ 1) : expectedSequence;
+        int isNew = receivedSequence == rxSequence;
+        int nextExpected = isNew ? (rxSequence ^ 1) : rxSequence;
         unsigned char rr = nextExpected == 0 ? RR0 : RR1;
         if (writeSupervisionFrame(A_RX, rr) < 0) return -1;
 
         // Acknowledge duplicates without delivering the payload twice.
         if (!isNew) continue;
 
-        expectedSequence = nextExpected;
+        rxSequence = nextExpected;
         memcpy(packet, parser.data, parser.dataLength);
         return parser.dataLength;
     }
