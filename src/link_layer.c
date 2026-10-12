@@ -296,7 +296,7 @@ static void responseParser(unsigned char byte, ResponseParser *p) {
             if (byte == FLAG) p->state = FLAG_RCV;
             break;
         case FLAG_RCV:
-            if (byte == A_RX) p->state = A_RCV;
+            if (byte == A_TX) p->state = A_RCV;
             else if (byte != FLAG) p->state = START;
             break;
         case A_RCV:
@@ -308,7 +308,7 @@ static void responseParser(unsigned char byte, ResponseParser *p) {
             else p->state = START;
             break;
         case C_RCV:
-            if (byte == (A_RX ^ p->control)) p->state = BCC_OK;
+            if (byte == (A_TX ^ p->control)) p->state = BCC_OK;
             else if (byte == FLAG) p->state = FLAG_RCV;
             else p->state = START;
             break;
@@ -426,7 +426,7 @@ int llOpenRx(LinkLayer llParameters)
         supervisionFrameParser(byte, &state, A_TX, SET);
     }
 
-    if (writeSupervisionFrame(A_RX, UA) < 0) {
+    if (writeSupervisionFrame(A_TX, UA) < 0) {
         closeSerialPort();
         return -1;
     }
@@ -531,13 +531,13 @@ int llReceive(unsigned char *packet) {
         }
 
         if (parser.control == SET) {
-            if (writeSupervisionFrame(A_RX, UA) < 0) return -1;
+            if (writeSupervisionFrame(A_TX, UA) < 0) return -1;
             continue;
         }
 
         if (!parser.valid) {
             unsigned char rej = rxSequence == 0 ? REJ0 : REJ1;
-            if (writeSupervisionFrame(A_RX, rej) < 0) return -1;
+            if (writeSupervisionFrame(A_TX, rej) < 0) return -1;
             continue;
         }
 
@@ -545,7 +545,7 @@ int llReceive(unsigned char *packet) {
         int isNew = receivedSequence == rxSequence;
         int nextExpected = isNew ? (rxSequence ^ 1) : rxSequence;
         unsigned char rr = nextExpected == 0 ? RR0 : RR1;
-        if (writeSupervisionFrame(A_RX, rr) < 0) return -1;
+        if (writeSupervisionFrame(A_TX, rr) < 0) return -1;
 
         // Acknowledge duplicates without delivering the payload twice.
         if (!isNew) continue;
