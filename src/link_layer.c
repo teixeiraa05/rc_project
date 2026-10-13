@@ -359,6 +359,17 @@ int llOpenRx(LinkLayer llParameters)
         return -1;
     }
 
+    savedTimeout = llParameters.timeout;
+    savedRetries = llParameters.nRetransmissions;
+
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1) {
+        perror("sigaction");
+        closeSerialPort();
+        return -1;
+    }
+
     printf("Serial port %s opened\n", llParameters.serialPort);
 
     // Wait for the SET supervision frame sent by the transmitter.
@@ -516,45 +527,62 @@ int llReceive(unsigned char *packet) {
 ////////////////////////////////////////////////
 int llCloseTx()
 {
-    SupervisionFrameParser parser = {.state = START};
+    for (int att = 0; att <= savedRetries; att++) {
+        SupervisionFrameParser parser = {.state = START};
 
-    //send DISC
-    if (writeSupervisionFrame(A_TX, DISC) < 0) {
-        closeSerialPort();
-        return -1;
-    }
-
-    //receive and parse DISC
-    while (parser.state != STOP) {
-        unsigned char byte;
-        int bytes = readByteSerialPort(&byte);
-        if (bytes < 0) {
-            perror("readByteSerialPort");
+        // Send DISC again on each attempt.
+        if (writeSupervisionFrame(A_TX, DISC) < 0) {
             closeSerialPort();
             return -1;
         }
-        if (bytes == 0)
-            continue;
 
-        supervisionFrameParser(byte, A_RX, &parser);
-        if (parser.state == STOP && parser.control != DISC)
-            parser.state = START;
+        alarmEnabled = TRUE;
+        alarm(savedTimeout);
+
+        // Receive DISC until a valid reply arrives or the alarm expires.
+        while (parser.state != STOP && alarmEnabled) {
+            unsigned char byte;
+            int bytes = readByteSerialPort(&byte);
+            if (bytes < 0) {
+                if (errno == EINTR) {
+                    if (!alarmEnabled) break;
+                    continue;
+                }
+                alarmEnabled = FALSE;
+                alarm(0);
+                perror("readByteSerialPort");
+                closeSerialPort();
+                return -1;
+            }
+            if (bytes == 0)
+                continue;
+
+            supervisionFrameParser(byte, A_RX, &parser);
+            if (parser.state == STOP && parser.control != DISC)
+                parser.state = START;
+        }
+
+        alarmEnabled = FALSE;
+        alarm(0);
+
+        if (parser.state == STOP) {
+            // Send the final UA and close the serial port.
+            if (writeSupervisionFrame(A_TX, UA) < 0) {
+                closeSerialPort();
+                return -1;
+            }
+            if (closeSerialPort() < 0) {
+                perror("closeSerialPort");
+                return -1;
+            }
+            return 0;
+        }
     }
 
-    //send UA
-    if (writeSupervisionFrame(A_TX, UA) < 0) {
-        closeSerialPort();
-        return -1;
-    }
-
-    // Close serial port on exceeding the limit of retransmissions
+    // Close serial port on exceeding the limit of retransmissions.
     if (closeSerialPort() < 0)
-    {
         perror("closeSerialPort");
-        return -1;
-    }
-
-   return 0;
+    return -1;
 }
 
 int llCloseRx()
@@ -578,34 +606,54 @@ int llCloseRx()
             parser.state = START;
     }
 
-    if (writeSupervisionFrame(A_RX, DISC) < 0) {
-        closeSerialPort();
-        return -1;
-    }
+    for (int att = 0; att <= savedRetries; att++) {
+        parser.state = START;
 
-    parser.state = START;
-    while (parser.state != STOP) {
-        unsigned char byte;
-        int bytes = readByteSerialPort(&byte);
-        if (bytes < 0) {
-            perror("readByteSerialPort");
+        // Send DISC again if the final UA does not arrive.
+        if (writeSupervisionFrame(A_RX, DISC) < 0) {
             closeSerialPort();
             return -1;
         }
-        if (bytes == 0)
-            continue;
 
-        supervisionFrameParser(byte, A_TX, &parser);
-        if (parser.state == STOP && parser.control != UA)
-            parser.state = START;
+        alarmEnabled = TRUE;
+        alarm(savedTimeout);
+
+        while (parser.state != STOP && alarmEnabled) {
+            unsigned char byte;
+            int bytes = readByteSerialPort(&byte);
+            if (bytes < 0) {
+                if (errno == EINTR) {
+                    if (!alarmEnabled) break;
+                    continue;
+                }
+                alarmEnabled = FALSE;
+                alarm(0);
+                perror("readByteSerialPort");
+                closeSerialPort();
+                return -1;
+            }
+            if (bytes == 0)
+                continue;
+
+            supervisionFrameParser(byte, A_TX, &parser);
+            if (parser.state == STOP && parser.control != UA)
+                parser.state = START;
+        }
+
+        alarmEnabled = FALSE;
+        alarm(0);
+
+        if (parser.state == STOP) {
+            if (closeSerialPort() < 0) {
+                perror("closeSerialPort");
+                return -1;
+            }
+            return 0;
+        }
     }
 
-    // Close serial port on exceeding the limit of retransmissions
+    // Close serial port on exceeding the limit of retransmissions.
     if (closeSerialPort() < 0)
-    {
         perror("closeSerialPort");
-        return -1;
-    }
-
-    return 0;
+    return -1;
 }
