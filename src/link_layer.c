@@ -64,11 +64,15 @@ typedef struct {
     unsigned char control;
     unsigned char data[MAX_PAYLOAD_SIZE + 1];
     int dataLength;
-    // XOR of all destuffed body bytes, including the received BCC2.
-    unsigned char bcc2;
+    unsigned char bcc2; // XOR of destuffed payload bytes and the received BCC2.
     int valid;
     int escaped;
-} FrameParserState;
+} IFrameParser;
+
+typedef struct {
+    State state;
+    unsigned char control;
+} SupervisionFrameParser;
 
 static void alarmHandler(int signal) {
     alarmEnabled = FALSE;
@@ -107,33 +111,35 @@ static int writeSupervisionFrame(unsigned char address, unsigned char control) {
     return 0;
 }
 
-// For now just pass the role (used for SET/UA during llopen)
-static void supervisionFrameParser(unsigned char byte, State *state, unsigned char address, unsigned char control) {
-    unsigned char expectedBCC = address ^ control;
-
-    switch (*state)
+// Parse a complete supervision frame using the expected address.
+static void supervisionFrameParser(unsigned char byte, unsigned char address, SupervisionFrameParser *parser) {
+    switch (parser->state)
     {
         case START:
-            if (byte == FLAG) *state = FLAG_RCV;
+            if (byte == FLAG) parser->state = FLAG_RCV;
             break;
         case FLAG_RCV:
-            if (byte == address) *state = A_RCV;
-            else if (byte == FLAG) *state = FLAG_RCV;
-            else *state = START;
+            if (byte == address) parser->state = A_RCV;
+            else if (byte == FLAG) parser->state = FLAG_RCV;
+            else parser->state = START;
             break;
         case A_RCV:
-            if (byte == control) *state = C_RCV;
-            else if (byte == FLAG) *state = FLAG_RCV;
-            else *state = START;
+            if (byte == SET || byte == UA || byte == DISC ||
+                byte == RR0 || byte == RR1 || byte == REJ0 || byte == REJ1) {
+                parser->control = byte;
+                parser->state = C_RCV;
+            }
+            else if (byte == FLAG) parser->state = FLAG_RCV;
+            else parser->state = START;
             break;
         case C_RCV:
-            if (byte == expectedBCC) *state = BCC_OK;
-            else if (byte == FLAG) *state = FLAG_RCV;
-            else *state = START;
+            if (byte == (address ^ parser->control)) parser->state = BCC_OK;
+            else if (byte == FLAG) parser->state = FLAG_RCV;
+            else parser->state = START;
             break;
         case BCC_OK:
-            if (byte == FLAG) *state = STOP;
-            else *state = START;
+            if (byte == FLAG) parser->state = STOP;
+            else parser->state = START;
             break;
         default:
             break;
@@ -181,7 +187,7 @@ static int destuffByte(unsigned char byte, unsigned char *output, int *escaped) 
   its XOR checksum, and validate BCC2 when the closing flag arrives.
   Update the parser state to finish the frame or discard a malformed body.
 */
-static void parseInfoBodyByte(unsigned char byte, FrameParserState *parser) {
+static void parseInfoBodyByte(unsigned char byte, IFrameParser *parser) {
     unsigned char decoded;
     // An unescaped flag ends the body; payload XOR received BCC2 must be zero.
     if (byte == FLAG && !parser->escaped) {
@@ -223,9 +229,8 @@ static void parseInfoBodyByte(unsigned char byte, FrameParserState *parser) {
     parser->bcc2 ^= decoded;
 }
 
-// Parses I-frames. Also recognises a retransmitted SET (lost UA), which has
-// no body: it goes C_RCV -> BCC_OK -> STOP with valid = TRUE.
-static void iFrameParser(unsigned char byte, FrameParserState *parser) {
+// Parses information frames.
+static void iFrameParser(unsigned char byte, IFrameParser *parser) {
     State *state = &parser->state;
 
     switch (*state)
@@ -239,7 +244,7 @@ static void iFrameParser(unsigned char byte, FrameParserState *parser) {
             else *state = START;
             break;
         case A_RCV:
-            if (byte == I0 || byte == I1 || byte == SET) {
+            if (byte == I0 || byte == I1) {
                 parser->control = byte;
                 *state = C_RCV;
             }
@@ -249,24 +254,12 @@ static void iFrameParser(unsigned char byte, FrameParserState *parser) {
         case C_RCV:
             if (byte == (A_TX ^ parser->control)) {
                 parser->valid = FALSE;
-                if (parser->control == SET) {
-                    *state = BCC_OK;
-                    break;
-                }
                 parser->dataLength = 0;
                 parser->bcc2 = 0;
                 parser->escaped = FALSE;
                 *state = DATA_RCV;
             }
             else if (byte == FLAG) *state = FLAG_RCV;
-            else *state = START;
-            break;
-        case BCC_OK:
-            // Only reached for SET frames.
-            if (byte == FLAG) {
-                parser->valid = TRUE;
-                *state = STOP;
-            }
             else *state = START;
             break;
         case DATA_RCV: 
@@ -281,41 +274,6 @@ static void iFrameParser(unsigned char byte, FrameParserState *parser) {
         default:
             parser->valid = FALSE;
             *state = START;
-            break;
-    }
-}
-
-typedef struct {
-    State state;
-    unsigned char control;   // which reply arrived: RR0, RR1, REJ0 or REJ1
-} ResponseParser;
-
-static void responseParser(unsigned char byte, ResponseParser *p) {
-    switch (p->state) {
-        case START:
-            if (byte == FLAG) p->state = FLAG_RCV;
-            break;
-        case FLAG_RCV:
-            if (byte == A_TX) p->state = A_RCV;
-            else if (byte != FLAG) p->state = START;
-            break;
-        case A_RCV:
-            if (byte == RR0 || byte == RR1 || byte == REJ0 || byte == REJ1) {
-                p->control = byte;
-                p->state = C_RCV;
-            }
-            else if (byte == FLAG) p->state = FLAG_RCV;
-            else p->state = START;
-            break;
-        case C_RCV:
-            if (byte == (A_TX ^ p->control)) p->state = BCC_OK;
-            else if (byte == FLAG) p->state = FLAG_RCV;
-            else p->state = START;
-            break;
-        case BCC_OK:
-            p->state = (byte == FLAG) ? STOP : START;
-            break;
-        default:
             break;
     }
 }
@@ -348,7 +306,7 @@ int llOpenTx(LinkLayer llParameters) {
 
     for (int att = 0; att <= llParameters.nRetransmissions; att++) {
 
-        State state = START;
+        SupervisionFrameParser parser = {.state = START};
 
         if (writeSupervisionFrame(A_TX, SET) < 0) {
             closeSerialPort();
@@ -358,7 +316,7 @@ int llOpenTx(LinkLayer llParameters) {
         alarmEnabled = TRUE;
         alarm(llParameters.timeout);
 
-        while (state != STOP && alarmEnabled) {
+        while (parser.state != STOP && alarmEnabled) {
             unsigned char byte;
             int bytes = readByteSerialPort(&byte);
 
@@ -377,12 +335,14 @@ int llOpenTx(LinkLayer llParameters) {
             if (bytes == 0)
                 continue;
 
-            supervisionFrameParser(byte, &state, A_TX, UA);
+            supervisionFrameParser(byte, A_TX, &parser);
+            if (parser.state == STOP && parser.control != UA)
+                parser.state = START;
         }
 
         alarmEnabled = FALSE;
         alarm(0);
-        if (state == STOP)
+        if (parser.state == STOP)
             return 0;
     }
 
@@ -409,8 +369,8 @@ int llOpenRx(LinkLayer llParameters)
     printf("Serial port %s opened\n", llParameters.serialPort);
 
     // Wait for the SET supervision frame sent by the transmitter.
-    State state = START;
-    while (state != STOP)
+    SupervisionFrameParser parser = {.state = START};
+    while (parser.state != STOP)
     {
         unsigned char byte;
         int bytes = readByteSerialPort(&byte);
@@ -423,7 +383,9 @@ int llOpenRx(LinkLayer llParameters)
         if (bytes == 0)
             continue;
 
-        supervisionFrameParser(byte, &state, A_TX, SET);
+        supervisionFrameParser(byte, A_TX, &parser);
+        if (parser.state == STOP && parser.control != SET)
+            parser.state = START;
     }
 
     if (writeSupervisionFrame(A_TX, UA) < 0) {
@@ -468,11 +430,12 @@ int llSend(const unsigned char *buf, int bufSize)
     frame[n++] = FLAG;
 
     unsigned char okResponse = (txSequence == 0) ? RR1 : RR0;
+    unsigned char rejectResponse = (txSequence == 0) ? REJ0 : REJ1;
 
     for (int att = 0; att <= savedRetries; att++) {
         if (writeBytesSerialPort(frame, n) != n) return -1;
 
-        ResponseParser p = {.state = START};
+        SupervisionFrameParser p = {.state = START};
         alarmEnabled = TRUE;
         alarm(savedTimeout);
 
@@ -492,7 +455,11 @@ int llSend(const unsigned char *buf, int bufSize)
             }
             if (bytes == 0) continue;
 
-            responseParser(byte, &p);
+            supervisionFrameParser(byte, A_TX, &p);
+            // Unrelated replies do not consume a retry or restart the timer.
+            if (p.state == STOP && p.control != okResponse &&
+                p.control != rejectResponse)
+                p.state = START;
         }
 
         alarm(0);
@@ -504,7 +471,7 @@ int llSend(const unsigned char *buf, int bufSize)
             txSequence ^= 1;
             return bufSize;
         }
-        // REJ or RR for the same frame: loop and retransmit
+        // Matching REJ: loop and retransmit.
     }
 
     return -1;                              // too many retransmissions
@@ -515,7 +482,7 @@ int llSend(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 int llReceive(unsigned char *packet) {
     while (TRUE) {
-        FrameParserState parser = {.state = START};
+        IFrameParser parser = {.state = START};
 
         while (parser.state != STOP) {
             unsigned char byte;
@@ -528,11 +495,6 @@ int llReceive(unsigned char *packet) {
             }
             if (bytes == 0) continue;
             iFrameParser(byte, &parser);
-        }
-
-        if (parser.control == SET) {
-            if (writeSupervisionFrame(A_TX, UA) < 0) return -1;
-            continue;
         }
 
         if (!parser.valid) {
