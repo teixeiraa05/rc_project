@@ -346,13 +346,6 @@ int llOpenTx(LinkLayer llParameters) {
             return 0;
     }
 
-    // Close serial port on exceeding the limit of retransmissions
-    if (closeSerialPort() < 0)
-    {
-        perror("closeSerialPort");
-        return -1;
-    }
-
     printf("Serial port %s closed\n", llParameters.serialPort);
 
     return -1;
@@ -523,14 +516,96 @@ int llReceive(unsigned char *packet) {
 ////////////////////////////////////////////////
 int llCloseTx()
 {
-    // TODO: Implement this function
+    SupervisionFrameParser parser = {.state = START};
 
-    return 0;
+    //send DISC
+    if (writeSupervisionFrame(A_TX, DISC) < 0) {
+        closeSerialPort();
+        return -1;
+    }
+
+    //receive and parse DISC
+    while (parser.state != STOP) {
+        unsigned char byte;
+        int bytes = readByteSerialPort(&byte);
+        if (bytes < 0) {
+            perror("readByteSerialPort");
+            closeSerialPort();
+            return -1;
+        }
+        if (bytes == 0)
+            continue;
+
+        supervisionFrameParser(byte, A_RX, &parser);
+        if (parser.state == STOP && parser.control != DISC)
+            parser.state = START;
+    }
+
+    //send UA
+    if (writeSupervisionFrame(A_TX, UA) < 0) {
+        closeSerialPort();
+        return -1;
+    }
+
+    // Close serial port on exceeding the limit of retransmissions
+    if (closeSerialPort() < 0)
+    {
+        perror("closeSerialPort");
+        return -1;
+    }
+
+   return 0;
 }
 
 int llCloseRx()
 {
-    // TODO: Implement this function
+    SupervisionFrameParser parser = {.state = START};
+    
+    //when it receives a DISC, parse it, and send another one to the transmitter
+    while (parser.state != STOP) {
+        unsigned char byte;
+        int bytes = readByteSerialPort(&byte);
+        if (bytes < 0) {
+            perror("readByteSerialPort");
+            closeSerialPort();
+            return -1;
+        }
+        if (bytes == 0)
+            continue;
+
+        supervisionFrameParser(byte, A_TX, &parser);
+        if (parser.state == STOP && parser.control != DISC)
+            parser.state = START;
+    }
+
+    if (writeSupervisionFrame(A_RX, DISC) < 0) {
+        closeSerialPort();
+        return -1;
+    }
+
+    parser.state = START;
+    while (parser.state != STOP) {
+        unsigned char byte;
+        int bytes = readByteSerialPort(&byte);
+        if (bytes < 0) {
+            perror("readByteSerialPort");
+            closeSerialPort();
+            return -1;
+        }
+        if (bytes == 0)
+            continue;
+
+        supervisionFrameParser(byte, A_TX, &parser);
+        if (parser.state == STOP && parser.control != UA)
+            parser.state = START;
+    }
+
+    // Close serial port on exceeding the limit of retransmissions
+    if (closeSerialPort() < 0)
+    {
+        perror("closeSerialPort");
+        return -1;
+    }
 
     return 0;
 }
