@@ -58,19 +58,19 @@ static int buildControl(FILE *file, const char *filename, unsigned char control,
     return 9 + nameLength;
 }
 
-static void sendFile(FILE *file, const char *filename)
+static int sendFile(FILE *file, const char *filename)
 {
     unsigned char packet[MAX_PAYLOAD_SIZE];
     int packetLength = buildControl(file, filename, START, packet);
     if (packetLength == -1) {
         fprintf(stderr, "Failed to build START control packet.\n");
-        return;
+        return -1;
     }
 
     // Send the START control packet
     if (llSend(packet, packetLength) == -1) {
         fprintf(stderr, "Failed to send START control packet.\n");
-        return;
+        return -1;
     }
 
     // Read and send the file data in DATA packets
@@ -82,20 +82,26 @@ static void sendFile(FILE *file, const char *filename)
 
         if (llSend(packet, bytesRead + 3) == -1) { // +3 for control and length bytes
             fprintf(stderr, "Failed to send DATA packet.\n");
-            return;
+            return -1;
         }
+    }
+
+    if (ferror(file)) {
+        fprintf(stderr, "Failed to read input file.\n");
+        return -1;
     }
 
     // Send the END control packet
     packetLength = buildControl(file, filename, END, packet);
     if (packetLength == -1) {
         fprintf(stderr, "Failed to build END control packet.\n");
-        return;
+        return -1;
     }
     if (llSend(packet, packetLength) == -1) {
         fprintf(stderr, "Failed to send END control packet.\n");
-        return;
+        return -1;
     }
+    return 0;
 }
 
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
@@ -123,8 +129,13 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
     if (strcmp(role, "tx") == 0)
     {
-        llOpenTx(llParameters);
-        sendFile(file, filename);
+        if (llOpenTx(llParameters) < 0) {
+            fprintf(stderr, "Failed to open transmitter connection.\n");
+            fclose(file);
+            return;
+        }
+        if (sendFile(file, filename) < 0)
+            fprintf(stderr, "File transfer failed.\n");
         llCloseTx();
     }
     else if (strcmp(role, "rx") == 0)
