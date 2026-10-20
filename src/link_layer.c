@@ -437,7 +437,20 @@ int llSend(const unsigned char *buf, int bufSize)
     unsigned char rejectResponse = (txSequence == 0) ? REJ0 : REJ1;
 
     for (int att = 0; att <= savedRetries; att++) {
-        if (writeBytesSerialPort(frame, n) != n) return -1;
+        int written = 0;
+        while (written < n) {
+            int bytes = writeBytesSerialPort(frame + written, n - written);
+            if (bytes < 0) {
+                if (errno == EINTR) continue;
+                perror("writeBytesSerialPort");
+                return -1;
+            }
+            if (bytes == 0) {
+                fprintf(stderr, "Serial write made no progress\n");
+                return -1;
+            }
+            written += bytes;
+        }
 
         SupervisionFrameParser p = {.state = START};
         alarmEnabled = TRUE;
