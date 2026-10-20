@@ -346,8 +346,8 @@ int llOpenTx(LinkLayer llParameters) {
             return 0;
     }
 
-    printf("Serial port %s closed\n", llParameters.serialPort);
-
+    if (closeSerialPort() < 0)
+        perror("closeSerialPort");
     return -1;
 }
 
@@ -514,14 +514,15 @@ int llReceive(unsigned char *packet) {
             iFrameParser(byte, &parser);
         }
 
-        if (!parser.valid) {
+        int receivedSequence = parser.control == I1;
+        int isNew = receivedSequence == rxSequence;
+
+        if (!parser.valid && isNew) {
             unsigned char rej = rxSequence == 0 ? REJ0 : REJ1;
             if (writeSupervisionFrame(A_TX, rej) < 0) return -1;
             continue;
         }
 
-        int receivedSequence = parser.control == I1;
-        int isNew = receivedSequence == rxSequence;
         int nextExpected = isNew ? (rxSequence ^ 1) : rxSequence;
         unsigned char rr = nextExpected == 0 ? RR0 : RR1;
         if (writeSupervisionFrame(A_TX, rr) < 0) return -1;
@@ -580,7 +581,7 @@ int llCloseTx()
 
         if (parser.state == STOP) {
             // Send the final UA and close the serial port.
-            if (writeSupervisionFrame(A_TX, UA) < 0) {
+            if (writeSupervisionFrame(A_RX, UA) < 0) {
                 closeSerialPort();
                 return -1;
             }
@@ -648,7 +649,7 @@ int llCloseRx()
             if (bytes == 0)
                 continue;
 
-            supervisionFrameParser(byte, A_TX, &parser);
+            supervisionFrameParser(byte, A_RX, &parser);
             if (parser.state == STOP && parser.control != UA)
                 parser.state = START;
         }
