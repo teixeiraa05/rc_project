@@ -32,14 +32,15 @@
 #define DISC 0x0B
 #define I0 0x00
 #define I1 0x80
+#define NO_ALT_CTRL 0x00
 
 #define ESC 0x7D
 #define ESCAPED_FLAG (FLAG ^ 0x20)
 #define ESCAPED_ESCAPED (ESC ^ 0x20)
 
 
-static int alarmEnabled = FALSE;
-static int alarmCount = 0;
+static volatile sig_atomic_t alarmEnabled = FALSE;
+static volatile sig_atomic_t alarmCount = 0;
 
 static int rxSequence = 0;
 static int txSequence = 0;
@@ -144,6 +145,52 @@ static void supervisionFrameParser(unsigned char byte, unsigned char address, Su
         default:
             break;
     }
+}
+
+
+// Returns the accepted control byte, -2 on timeout, or -1 on signal setup/read error.
+static int waitForSupervisionReply (unsigned char address, unsigned char expectedcontrol, unsigned char alternativeControl) {
+
+    SupervisionFrameParser parser = {.state = START};
+
+    // Alarm installation
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1) {
+        perror("sigaction");
+        return -1;
+    }
+
+    alarmEnabled = TRUE;
+    alarm(savedTimeout);
+
+    while (parser.state != STOP && alarmEnabled) {
+        unsigned char byte;
+        int bytes = readByteSerialPort(&byte);
+
+        if (bytes < 0)
+        {
+            if (errno == EINTR) {
+                if (!alarmEnabled) break;
+                continue;
+            }
+            alarmEnabled = FALSE;
+            alarm(0);
+            perror("readByteSerialPort");
+            return -1;
+        }
+        if (bytes == 0)
+            continue;
+
+        supervisionFrameParser(byte, address, &parser);
+        if (parser.state == STOP && parser.control != expectedcontrol && parser.control != alternativeControl)
+            parser.state = START;
+    }
+
+    alarmEnabled = FALSE;
+    alarm(0);
+
+    return parser.state == STOP ? parser.control : -2;
 }
 
 // Byte stuffing
@@ -295,55 +342,14 @@ int llOpenTx(LinkLayer llParameters) {
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    // Alarm installation
-    struct sigaction act = {0};
-    act.sa_handler = &alarmHandler;
-    if (sigaction(SIGALRM, &act, NULL) == -1) {
-        perror("sigaction");
-        closeSerialPort();
-        return -1;
-    }
-
     for (int att = 0; att <= llParameters.nRetransmissions; att++) {
-
-        SupervisionFrameParser parser = {.state = START};
-
         if (writeSupervisionFrame(A_TX, SET) < 0) {
-            closeSerialPort();
-            return -1;
+            break;
         }
 
-        alarmEnabled = TRUE;
-        alarm(llParameters.timeout);
-
-        while (parser.state != STOP && alarmEnabled) {
-            unsigned char byte;
-            int bytes = readByteSerialPort(&byte);
-
-            if (bytes < 0)
-            {
-                if (errno == EINTR) {
-                    if (!alarmEnabled) break;
-                    continue;
-                }
-                alarmEnabled = FALSE;
-                alarm(0);
-                perror("readByteSerialPort");
-                closeSerialPort();
-                return -1;
-            }
-            if (bytes == 0)
-                continue;
-
-            supervisionFrameParser(byte, A_TX, &parser);
-            if (parser.state == STOP && parser.control != UA)
-                parser.state = START;
-        }
-
-        alarmEnabled = FALSE;
-        alarm(0);
-        if (parser.state == STOP)
-            return 0;
+        int ret = waitForSupervisionReply(A_TX, UA, NO_ALT_CTRL);
+        if (ret == UA) return 0;
+        if (ret == -1) break;
     }
 
     if (closeSerialPort() < 0)
@@ -362,34 +368,16 @@ int llOpenRx(LinkLayer llParameters)
     savedTimeout = llParameters.timeout;
     savedRetries = llParameters.nRetransmissions;
 
-    struct sigaction act = {0};
-    act.sa_handler = &alarmHandler;
-    if (sigaction(SIGALRM, &act, NULL) == -1) {
-        perror("sigaction");
-        closeSerialPort();
-        return -1;
-    }
-
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    // Wait for the SET supervision frame sent by the transmitter.
-    SupervisionFrameParser parser = {.state = START};
-    while (parser.state != STOP)
-    {
-        unsigned char byte;
-        int bytes = readByteSerialPort(&byte);
-        if (bytes < 0)
-        {
-            perror("readByteSerialPort");
-            closeSerialPort();
-            return -1;
-        }
-        if (bytes == 0)
-            continue;
-
-        supervisionFrameParser(byte, A_TX, &parser);
-        if (parser.state == STOP && parser.control != SET)
-            parser.state = START;
+    int ret = -2;
+    for (int att = 0; att <= savedRetries; att++) {
+        ret = waitForSupervisionReply(A_TX, SET, NO_ALT_CTRL);
+        if (ret != -2) break;
+    }
+    if (ret != SET) {
+        closeSerialPort();
+        return -1;
     }
 
     if (writeSupervisionFrame(A_TX, UA) < 0) {
@@ -452,43 +440,14 @@ int llSend(const unsigned char *buf, int bufSize)
             written += bytes;
         }
 
-        SupervisionFrameParser p = {.state = START};
-        alarmEnabled = TRUE;
-        alarm(savedTimeout);
+        int ret = waitForSupervisionReply(A_TX, okResponse, rejectResponse);
+        if (ret == -1) return -1;
 
-        while (p.state != STOP && alarmEnabled) {
-            unsigned char byte;
-            int bytes = readByteSerialPort(&byte);
-
-            if (bytes < 0) {
-                if (errno == EINTR) {
-                    if (!alarmEnabled) break;
-                    continue;
-                }
-                alarm(0);
-                alarmEnabled = FALSE;
-                perror("readByteSerialPort");
-                return -1;
-            }
-            if (bytes == 0) continue;
-
-            supervisionFrameParser(byte, A_TX, &p);
-            // Unrelated replies do not consume a retry or restart the timer.
-            if (p.state == STOP && p.control != okResponse &&
-                p.control != rejectResponse)
-                p.state = START;
-        }
-
-        alarm(0);
-        alarmEnabled = FALSE;
-
-        if (p.state != STOP) continue;      // timeout: retransmit
-
-        if (p.control == okResponse) {      // acknowledged
+        if (ret == okResponse) {            // acknowledged
             txSequence ^= 1;
             return bufSize;
         }
-        // Matching REJ: loop and retransmit.
+        // Timeout or matching REJ: retransmit.
     }
 
     return -1;                              // too many retransmissions
@@ -542,44 +501,19 @@ int llReceive(unsigned char *packet) {
 int llCloseTx()
 {
     for (int att = 0; att <= savedRetries; att++) {
-        SupervisionFrameParser parser = {.state = START};
-
         // Send DISC again on each attempt.
         if (writeSupervisionFrame(A_TX, DISC) < 0) {
             closeSerialPort();
             return -1;
         }
 
-        alarmEnabled = TRUE;
-        alarm(savedTimeout);
-
-        // Receive DISC until a valid reply arrives or the alarm expires.
-        while (parser.state != STOP && alarmEnabled) {
-            unsigned char byte;
-            int bytes = readByteSerialPort(&byte);
-            if (bytes < 0) {
-                if (errno == EINTR) {
-                    if (!alarmEnabled) break;
-                    continue;
-                }
-                alarmEnabled = FALSE;
-                alarm(0);
-                perror("readByteSerialPort");
-                closeSerialPort();
-                return -1;
-            }
-            if (bytes == 0)
-                continue;
-
-            supervisionFrameParser(byte, A_RX, &parser);
-            if (parser.state == STOP && parser.control != DISC)
-                parser.state = START;
+        int ret = waitForSupervisionReply(A_RX, DISC, NO_ALT_CTRL);
+        if (ret == -1) {
+            closeSerialPort();
+            return -1;
         }
 
-        alarmEnabled = FALSE;
-        alarm(0);
-
-        if (parser.state == STOP) {
+        if (ret == DISC) {
             // Send the final UA and close the serial port.
             if (writeSupervisionFrame(A_RX, UA) < 0) {
                 closeSerialPort();
@@ -601,63 +535,30 @@ int llCloseTx()
 
 int llCloseRx()
 {
-    SupervisionFrameParser parser = {.state = START};
-    
-    //when it receives a DISC, parse it, and send another one to the transmitter
-    while (parser.state != STOP) {
-        unsigned char byte;
-        int bytes = readByteSerialPort(&byte);
-        if (bytes < 0) {
-            perror("readByteSerialPort");
-            closeSerialPort();
-            return -1;
-        }
-        if (bytes == 0)
-            continue;
-
-        supervisionFrameParser(byte, A_TX, &parser);
-        if (parser.state == STOP && parser.control != DISC)
-            parser.state = START;
+    int ret = -2;
+    for (int att = 0; att <= savedRetries; att++) {
+        ret = waitForSupervisionReply(A_TX, DISC, NO_ALT_CTRL);
+        if (ret != -2) break;
+    }
+    if (ret != DISC) {
+        closeSerialPort();
+        return -1;
     }
 
     for (int att = 0; att <= savedRetries; att++) {
-        parser.state = START;
-
         // Send DISC again if the final UA does not arrive.
         if (writeSupervisionFrame(A_RX, DISC) < 0) {
             closeSerialPort();
             return -1;
         }
 
-        alarmEnabled = TRUE;
-        alarm(savedTimeout);
-
-        while (parser.state != STOP && alarmEnabled) {
-            unsigned char byte;
-            int bytes = readByteSerialPort(&byte);
-            if (bytes < 0) {
-                if (errno == EINTR) {
-                    if (!alarmEnabled) break;
-                    continue;
-                }
-                alarmEnabled = FALSE;
-                alarm(0);
-                perror("readByteSerialPort");
-                closeSerialPort();
-                return -1;
-            }
-            if (bytes == 0)
-                continue;
-
-            supervisionFrameParser(byte, A_RX, &parser);
-            if (parser.state == STOP && parser.control != UA)
-                parser.state = START;
+        int ret = waitForSupervisionReply(A_RX, UA, NO_ALT_CTRL);
+        if (ret == -1) {
+            closeSerialPort();
+            return -1;
         }
 
-        alarmEnabled = FALSE;
-        alarm(0);
-
-        if (parser.state == STOP) {
+        if (ret == UA) {
             if (closeSerialPort() < 0) {
                 perror("closeSerialPort");
                 return -1;
