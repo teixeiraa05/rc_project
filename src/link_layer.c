@@ -187,7 +187,7 @@ static int destuffByte(unsigned char byte, unsigned char *output, int *escaped) 
   its XOR checksum, and validate BCC2 when the closing flag arrives.
   Update the parser state to finish the frame or discard a malformed body.
 */
-static void parseInfoBodyByte(unsigned char byte, IFrameParser *parser) {
+static void infoBodyByteParser(unsigned char byte, IFrameParser *parser) {
     unsigned char decoded;
     // An unescaped flag ends the body; payload XOR received BCC2 must be zero.
     if (byte == FLAG && !parser->escaped) {
@@ -263,7 +263,7 @@ static void iFrameParser(unsigned char byte, IFrameParser *parser) {
             else *state = START;
             break;
         case DATA_RCV: 
-            parseInfoBodyByte(byte, parser);
+            infoBodyByteParser(byte, parser);
             break; 
         case DISCARD_DATA:
             // Drain the damaged body before asking for retransmission.
