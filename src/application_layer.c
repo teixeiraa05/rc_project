@@ -13,7 +13,7 @@
 #define DATA 0x02
 #define END 0x03
 
-// Return the packet type, or -1; START/END also supply the file size.
+// Return the packet type, or -1; START/END supply the file size if requested.
 static int validatePacket(const unsigned char *packet, int packetLength, uint32_t *fileSize)
 {
     if (packetLength < 1 || packetLength > MAX_PAYLOAD_SIZE) return -1;
@@ -28,17 +28,19 @@ static int validatePacket(const unsigned char *packet, int packetLength, uint32_
     int hasSize = FALSE;
     int hasName = FALSE;
     uint32_t size = 0;
+
+    //TLV parsing
     for (int offset = 1; offset < packetLength;) {
         if (packetLength - offset < 2) return -1;
-        unsigned char type = packet[offset++];
-        int length = packet[offset++];
-        if (length > packetLength - offset) return -1;
+        unsigned char type = packet[offset++]; //T
+        int length = packet[offset++]; //L
+        if (length > packetLength - offset) return -1; //if the length of the cur packet is more than the nr of bytes that can be accepted, then we reject it
 
-        if (type == 0) {
+        if (type == 0) { //if it is a size field
             if (hasSize || length != 4) return -1;
             hasSize = TRUE;
             for (int i = 0; i < length; i++)
-                size = (size << 8) | packet[offset + i];
+                size = (size << 8) | packet[offset + i]; //V
         } else if (type == 1) {
             if (hasName) return -1;
             hasName = TRUE;
@@ -47,7 +49,7 @@ static int validatePacket(const unsigned char *packet, int packetLength, uint32_
     }
 
     if (!hasSize) return -1;
-    *fileSize = size;
+    if (fileSize != NULL) *fileSize = size;
     return packet[0];
 }
 
@@ -174,9 +176,8 @@ static int receiveFile(const char *filename)
     int complete = FALSE;
     int result = -1;
     while (TRUE) {
-        uint32_t packetFileSize;
         packetLength = llReceive(packet);
-        int type = validatePacket(packet, packetLength, &packetFileSize);
+        int type = validatePacket(packet, packetLength, NULL);
         if (type == DATA) {
             size_t dataLength = packetLength - 3;
             if (dataLength > fileSize - bytesWritten) {
@@ -210,7 +211,6 @@ static int receiveFile(const char *filename)
         perror("fclose");
         result = -1;
     }
-    // shortcut: early errors cannot abort the link locally; add a link abort API for recovery.
     if (complete && llCloseRx() < 0) {
         fprintf(stderr, "Failed to close receiver connection.\n");
         result = -1;
