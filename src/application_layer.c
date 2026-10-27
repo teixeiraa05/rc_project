@@ -182,7 +182,6 @@ static int receiveFile(const char *filename)
     }
 
     uint32_t bytesWritten = 0;
-    int complete = FALSE;
     int result = -1;
     while (TRUE) {
         packetLength = llReceive(packet);
@@ -206,7 +205,6 @@ static int receiveFile(const char *filename)
                 fprintf(stderr, "END metadata or received file size does not match START.\n");
                 break;
             }
-            complete = TRUE;
             printf("[RX] END packet received. Metadata and file size match START.\n");
             result = 0;
             break;
@@ -220,13 +218,6 @@ static int receiveFile(const char *filename)
         perror("fclose");
         result = -1;
     }
-    if (complete && llCloseRx() < 0) {
-        fprintf(stderr, "Failed to close receiver connection.\n");
-        result = -1;
-    }
-    if (result == 0)
-        printf("[RX] File reception complete: '%s' (%lu bytes). Connection closed.\n",
-            filename, (unsigned long) bytesWritten);
     return result;
 }
 
@@ -264,8 +255,15 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             fprintf(stderr, "Failed to open receiver connection.\n");
             return;
         }
-        if (receiveFile(filename) < 0)
+        int result = receiveFile(filename);
+        if (result < 0)
             fprintf(stderr, "File reception failed.\n");
+        if (llCloseRx() < 0) {
+            fprintf(stderr, "Failed to close receiver connection.\n");
+            return;
+        }
+        if (result == 0)
+            printf("[RX] File reception complete: '%s'. Connection closed.\n", filename);
     }
     else
     {
