@@ -13,15 +13,24 @@
 #define DATA 0x02
 #define END 0x03
 
+#define FRAME_HEADER_SIZE 3
+#ifndef FILE_CHUNK_SIZE
+#define FILE_CHUNK_SIZE (MAX_PAYLOAD_SIZE - FRAME_HEADER_SIZE)
+#endif
+
+#if FILE_CHUNK_SIZE <= 0 || FILE_CHUNK_SIZE > MAX_PAYLOAD_SIZE - FRAME_HEADER_SIZE
+#error "FILE_CHUNK_SIZE must fit within MAX_PAYLOAD_SIZE minus FRAME_HEADER_SIZE"
+#endif
+
 // Return the packet type, or -1; START/END supply the file size if requested.
 static int validatePacket(const unsigned char *packet, int packetLength, uint32_t *fileSize)
 {
     if (packetLength < 1 || packetLength > MAX_PAYLOAD_SIZE) return -1;
 
     if (packet[0] == DATA) {
-        if (packetLength < 4) return -1;
+        if (packetLength < FRAME_HEADER_SIZE + 1) return -1;
         int dataLength = packet[1] * 256 + packet[2];
-        return dataLength == packetLength - 3 ? DATA : -1;
+        return dataLength == packetLength - FRAME_HEADER_SIZE ? DATA : -1;
     }
     if (packet[0] != START && packet[0] != END) return -1;
 
@@ -117,13 +126,13 @@ static int sendFile(FILE *file, const char *filename)
 
     // Read and send the file data in DATA packets
     size_t bytesRead;
-    while ((bytesRead = fread(packet + 3, 1, MAX_PAYLOAD_SIZE - 3, file)) > 0) {
+    while ((bytesRead = fread(packet + FRAME_HEADER_SIZE, 1, FILE_CHUNK_SIZE, file)) > 0) {
         packet[0] = DATA;
         packet[1] = (bytesRead >> 8) & 0xFF; // High byte of length
         packet[2] = bytesRead & 0xFF;        // Low byte of length
 
-        printf("[TX] Sending DATA packet (%zu file bytes, %zu packet bytes).\n", bytesRead, bytesRead + 3);
-        if (llSend(packet, bytesRead + 3) == -1) { // +3 for control and length bytes
+        printf("[TX] Sending DATA packet (%zu file bytes, %zu packet bytes).\n", bytesRead, bytesRead + FRAME_HEADER_SIZE);
+        if (llSend(packet, bytesRead + FRAME_HEADER_SIZE) == -1) {
             fprintf(stderr, "Failed to send DATA packet.\n");
             return -1;
         }
@@ -179,12 +188,12 @@ static int receiveFile(const char *filename)
         packetLength = llReceive(packet);
         int type = validatePacket(packet, packetLength, NULL);
         if (type == DATA) {
-            size_t dataLength = packetLength - 3;
+            size_t dataLength = packetLength - FRAME_HEADER_SIZE;
             if (dataLength > fileSize - bytesWritten) {
                 fprintf(stderr, "DATA exceeds the advertised file size.\n");
                 break;
             }
-            if (fwrite(packet + 3, 1, dataLength, file) != dataLength) {
+            if (fwrite(packet + FRAME_HEADER_SIZE, 1, dataLength, file) != dataLength) {
                 fprintf(stderr, "Failed to write output file.\n");
                 break;
             }
