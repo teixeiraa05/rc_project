@@ -230,6 +230,10 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         .nRetransmissions = nTries,
         .timeout = timeout,
     };
+    if (strlen(serialPort) >= sizeof(llParameters.serialPort)) {
+        fprintf(stderr, "Serial port name is too long.\n");
+        return;
+    }
     strcpy(llParameters.serialPort, serialPort);
 
     if (strcmp(role, "tx") == 0)

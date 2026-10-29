@@ -8,6 +8,49 @@ from run import ROOT
 
 
 class ApplicationChunkChecks(unittest.TestCase):
+    def test_serial_port_length_boundary(self):
+        source = r'''
+#include <assert.h>
+#include "APPLICATION_SOURCE"
+
+static int opens;
+int llOpenRx(LinkLayer parameters) {
+    assert(strlen(parameters.serialPort) == 49);
+    opens++;
+    return -1;
+}
+int llOpenTx(LinkLayer parameters) { assert(0); return -1; }
+int llSend(const unsigned char *packet, int length) { return -1; }
+int llReceive(unsigned char *packet) { return -1; }
+int llCloseTx(void) { return 0; }
+int llCloseRx(void) { return 0; }
+int main(void) {
+    char port[101];
+    memset(port, 'x', sizeof(port));
+    port[49] = '\0';
+    applicationLayer(port, "rx", 9600, 3, 4, "unused.bin");
+    assert(opens == 1);
+    port[49] = 'x';
+    port[50] = '\0';
+    applicationLayer(port, "rx", 9600, 3, 4, "unused.bin");
+    assert(opens == 1);
+    port[50] = 'x';
+    port[100] = '\0';
+    applicationLayer(port, "rx", 9600, 3, 4, "unused.bin");
+    assert(opens == 1);
+}
+'''.replace('APPLICATION_SOURCE', str(ROOT / 'src/application_layer.c'))
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            harness = folder / 'port_check.c'
+            harness.write_text(source)
+            executable = folder / 'check'
+            subprocess.run(['gcc', '-Wall', str(harness), '-o', str(executable)],
+                           check=True, capture_output=True)
+            result = subprocess.run([executable], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr.count('Serial port name is too long.'), 2)
+
     def test_receiver_connection_cleanup(self):
         source = r'''
 #include <assert.h>
