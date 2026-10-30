@@ -43,9 +43,20 @@ static volatile sig_atomic_t alarmEnabled = FALSE;
 static volatile sig_atomic_t alarmCount = 0;
 
 static int expectedRxSequence = 0;
+static int rxDisconnectReceived = FALSE;
 static int txSequence = 0;
 static int savedTimeout = 0;
 static int maxRetransmissions = 0;
+
+static struct Statistics {
+    unsigned long payloadBytes;
+    unsigned long informationFramesSent;
+    unsigned long informationFramesDelivered;
+    unsigned long retransmissions;
+    unsigned long rejectionsSent;
+    unsigned long rejectionsReceived;
+    unsigned long duplicateFrames;
+} statistics;
 
 typedef enum {
     START,
@@ -105,6 +116,7 @@ static int writeSupervisionFrame(unsigned char address, unsigned char control) {
         return -1;
     }
 
+    if (control == REJ0 || control == REJ1) statistics.rejectionsSent++;
     printf("%d bytes written to serial port\n", bytes);
     printf("FRAME = 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
         frame[0], frame[1], frame[2], frame[3], frame[4]);
@@ -139,7 +151,11 @@ static void parseSupervisionFrameByte(unsigned char byte, unsigned char address,
             else parser->state = START;
             break;
         case BCC_OK:
-            if (byte == FLAG) parser->state = STOP;
+            if (byte == FLAG) {
+                parser->state = STOP;
+                if (parser->control == REJ0 || parser->control == REJ1)
+                    statistics.rejectionsReceived++;
+            }
             else parser->state = START;
             break;
         default:
@@ -298,6 +314,25 @@ static void deactivateAlarm(void) {
     alarm(0);
 }
 
+static void resetStatistics(void) {
+    statistics = (struct Statistics){0};
+    alarmCount = 0;
+}
+
+static void printStatistics(void) {
+    printf("\nLink statistics:\n"
+           "  Payload bytes acknowledged/delivered: %lu\n"
+           "  I-frame transmissions (including retries): %lu\n"
+           "  I frames delivered: %lu\n"
+           "  Retransmissions (I/SET/DISC): %lu\n"
+           "  Timeouts: %d\n"
+           "  REJ sent/received: %lu/%lu\n"
+           "  Duplicate I frames discarded: %lu\n",
+           statistics.payloadBytes, statistics.informationFramesSent, statistics.informationFramesDelivered,
+           statistics.retransmissions, (int) alarmCount, statistics.rejectionsSent, statistics.rejectionsReceived,
+           statistics.duplicateFrames);
+}
+
 static int waitForSupervisionReply(unsigned char address, unsigned char expectedControl,
                                    unsigned char alternativeControl) {
     SupervisionFrameParser parser = {.state = START};
@@ -325,6 +360,7 @@ static int waitForSupervisionReply(unsigned char address, unsigned char expected
 static int exchangeSupervisionFrames(unsigned char sendAddress, unsigned char control,
                                      unsigned char replyAddress, unsigned char expectedControl) {
     for (int att = 0; att <= maxRetransmissions; att++) {
+        if (att > 0) statistics.retransmissions++;
         if (writeSupervisionFrame(sendAddress, control) < 0) return -1;
         int ret = waitForSupervisionReply(replyAddress, expectedControl, NO_ALT_CTRL);
         if (ret == expectedControl || ret == -1) return ret;
@@ -346,6 +382,7 @@ int llOpenTx(LinkLayer llParameters) {
     savedTimeout = llParameters.timeout;
     maxRetransmissions = llParameters.nRetransmissions;
     txSequence = 0;
+    resetStatistics();
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
@@ -367,6 +404,7 @@ int llOpenRx(LinkLayer llParameters)
     savedTimeout = llParameters.timeout;
     maxRetransmissions = llParameters.nRetransmissions;
 
+    resetStatistics();
     printf("Serial port %s opened\n", llParameters.serialPort);
 
     int ret = -2;
@@ -384,6 +422,7 @@ int llOpenRx(LinkLayer llParameters)
 
     printf("SET received; UA sent\n");
     expectedRxSequence = 0;
+    rxDisconnectReceived = FALSE;
 
     return 0;
 }
@@ -422,6 +461,7 @@ int llSend(const unsigned char *buf, int bufSize)
     unsigned char rejectResponse = (txSequence == 0) ? REJ0 : REJ1;
 
     for (int att = 0; att <= maxRetransmissions; att++) {
+        if (att > 0) statistics.retransmissions++;
         int written = 0;
         while (written < n) {
             int bytes = writeBytesSerialPort(frame + written, n - written);
@@ -437,11 +477,13 @@ int llSend(const unsigned char *buf, int bufSize)
             written += bytes;
         }
 
+        statistics.informationFramesSent++;
         int ret = waitForSupervisionReply(A_TX, okResponse, rejectResponse);
         if (ret == -1) return -1;
 
         if (ret == okResponse) {            // acknowledged
             txSequence ^= 1;
+            statistics.payloadBytes += bufSize;
             return bufSize;
         }
         // Timeout or matching REJ: retransmit.
@@ -454,6 +496,7 @@ int llSend(const unsigned char *buf, int bufSize)
 // LLRECEIVE
 ////////////////////////////////////////////////
 int llReceive(unsigned char *packet) {
+    SupervisionFrameParser supervision = {.state = START};
     while (TRUE) {
         IFrameParser parser = {.state = START};
 
@@ -467,6 +510,14 @@ int llReceive(unsigned char *packet) {
                 return -1;
             }
             if (bytes == 0) continue;
+            parseSupervisionFrameByte(byte, A_TX, &supervision);
+            if (supervision.state == STOP) {
+                if (supervision.control == DISC) {
+                    rxDisconnectReceived = TRUE;
+                    return -1;
+                }
+                supervision.state = FLAG_RCV;
+            }
             parseIFrameByte(byte, &parser);
         }
 
@@ -484,9 +535,14 @@ int llReceive(unsigned char *packet) {
         if (writeSupervisionFrame(A_TX, rr) < 0) return -1;
 
         // Acknowledge duplicates without delivering the payload twice.
-        if (!isNew) continue;
+        if (!isNew) {
+            statistics.duplicateFrames++;
+            continue;
+        }
 
         expectedRxSequence = nextExpected;
+        statistics.informationFramesDelivered++;
+        statistics.payloadBytes += parser.dataLength;
         memcpy(packet, parser.data, parser.dataLength);
         return parser.dataLength;
     }
@@ -497,41 +553,34 @@ int llReceive(unsigned char *packet) {
 ////////////////////////////////////////////////
 int llCloseTx()
 {
-    int ret = exchangeSupervisionFrames(A_TX, DISC, A_RX, DISC);
-    if (ret != DISC) {
-        if (closeSerialPort() < 0) perror("closeSerialPort");
-        return -1;
-    }
+    int result = -1;
+    if (exchangeSupervisionFrames(A_TX, DISC, A_RX, DISC) == DISC &&
+        writeSupervisionFrame(A_RX, UA) == 0)
+        result = 0;
 
-    if (writeSupervisionFrame(A_RX, UA) < 0) {
-        closeSerialPort();
-        return -1;
-    }
     if (closeSerialPort() < 0) {
         perror("closeSerialPort");
-        return -1;
+        result = -1;
     }
-    return 0;
+    printStatistics();
+    return result;
 }
 
 int llCloseRx()
 {
-    int ret = -2;
+    int ret = rxDisconnectReceived ? DISC : -2;
+    rxDisconnectReceived = FALSE;
     for (int att = 0; att <= maxRetransmissions && ret == -2; att++)
         ret = waitForSupervisionReply(A_TX, DISC, NO_ALT_CTRL);
-    if (ret != DISC) {
-        closeSerialPort();
-        return -1;
-    }
 
-    ret = exchangeSupervisionFrames(A_RX, DISC, A_RX, UA);
-    if (ret != UA) {
-        if (closeSerialPort() < 0) perror("closeSerialPort");
-        return -1;
-    }
+    int result = -1;
+    if (ret == DISC && exchangeSupervisionFrames(A_RX, DISC, A_RX, UA) == UA)
+        result = 0;
+
     if (closeSerialPort() < 0) {
         perror("closeSerialPort");
-        return -1;
+        result = -1;
     }
-    return 0;
+    printStatistics();
+    return result;
 }
