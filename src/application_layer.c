@@ -13,13 +13,13 @@
 #define DATA 0x02
 #define END 0x03
 
-#define FRAME_HEADER_SIZE 3
+#define DATA_PACKET_HEADER_SIZE 3
 #ifndef FILE_CHUNK_SIZE
-#define FILE_CHUNK_SIZE (MAX_PAYLOAD_SIZE - FRAME_HEADER_SIZE)
+#define FILE_CHUNK_SIZE (MAX_PAYLOAD_SIZE - DATA_PACKET_HEADER_SIZE)
 #endif
 
-#if FILE_CHUNK_SIZE <= 0 || FILE_CHUNK_SIZE > MAX_PAYLOAD_SIZE - FRAME_HEADER_SIZE
-#error "FILE_CHUNK_SIZE must fit within MAX_PAYLOAD_SIZE minus FRAME_HEADER_SIZE"
+#if FILE_CHUNK_SIZE <= 0 || FILE_CHUNK_SIZE > MAX_PAYLOAD_SIZE - DATA_PACKET_HEADER_SIZE
+#error "FILE_CHUNK_SIZE must fit within MAX_PAYLOAD_SIZE minus DATA_PACKET_HEADER_SIZE"
 #endif
 
 // Return the packet type, or -1; START/END supply the file size if requested.
@@ -28,9 +28,9 @@ static int validatePacket(const unsigned char *packet, int packetLength, uint32_
     if (packetLength < 1 || packetLength > MAX_PAYLOAD_SIZE) return -1;
 
     if (packet[0] == DATA) {
-        if (packetLength < FRAME_HEADER_SIZE + 1) return -1;
+        if (packetLength < DATA_PACKET_HEADER_SIZE + 1) return -1;
         int dataLength = packet[1] * 256 + packet[2];
-        return dataLength == packetLength - FRAME_HEADER_SIZE ? DATA : -1;
+        return dataLength == packetLength - DATA_PACKET_HEADER_SIZE ? DATA : -1;
     }
     if (packet[0] != START && packet[0] != END) return -1;
 
@@ -74,7 +74,7 @@ static long getFileSize(FILE *file)
 }
 
 // Return the packet length, or -1 on error.
-static int buildControl(FILE *file, const char *filename, unsigned char control, unsigned char *packet)
+static int buildControlPacket(FILE *file, const char *filename, unsigned char control, unsigned char *packet)
 {
     size_t nameLength = strlen(filename);
     if (nameLength > UINT8_MAX || 9 + nameLength > MAX_PAYLOAD_SIZE) {
@@ -110,7 +110,7 @@ static int buildControl(FILE *file, const char *filename, unsigned char control,
 static int sendFile(FILE *file, const char *filename)
 {
     unsigned char packet[MAX_PAYLOAD_SIZE];
-    int packetLength = buildControl(file, filename, START, packet);
+    int packetLength = buildControlPacket(file, filename, START, packet);
     if (packetLength == -1) {
         fprintf(stderr, "Failed to build START control packet.\n");
         return -1;
@@ -126,13 +126,13 @@ static int sendFile(FILE *file, const char *filename)
 
     // Read and send the file data in DATA packets
     size_t bytesRead;
-    while ((bytesRead = fread(packet + FRAME_HEADER_SIZE, 1, FILE_CHUNK_SIZE, file)) > 0) {
+    while ((bytesRead = fread(packet + DATA_PACKET_HEADER_SIZE, 1, FILE_CHUNK_SIZE, file)) > 0) {
         packet[0] = DATA;
         packet[1] = (bytesRead >> 8) & 0xFF; // High byte of length
         packet[2] = bytesRead & 0xFF;        // Low byte of length
 
-        printf("[TX] Sending DATA packet (%zu file bytes, %zu packet bytes).\n", bytesRead, bytesRead + FRAME_HEADER_SIZE);
-        if (llSend(packet, bytesRead + FRAME_HEADER_SIZE) == -1) {
+        printf("[TX] Sending DATA packet (%zu file bytes, %zu packet bytes).\n", bytesRead, bytesRead + DATA_PACKET_HEADER_SIZE);
+        if (llSend(packet, bytesRead + DATA_PACKET_HEADER_SIZE) == -1) {
             fprintf(stderr, "Failed to send DATA packet.\n");
             return -1;
         }
@@ -145,7 +145,7 @@ static int sendFile(FILE *file, const char *filename)
     }
 
     // Send the END control packet
-    packetLength = buildControl(file, filename, END, packet);
+    packetLength = buildControlPacket(file, filename, END, packet);
     if (packetLength == -1) {
         fprintf(stderr, "Failed to build END control packet.\n");
         return -1;
@@ -187,12 +187,12 @@ static int receiveFile(const char *filename)
         packetLength = llReceive(packet);
         int type = validatePacket(packet, packetLength, NULL);
         if (type == DATA) {
-            size_t dataLength = packetLength - FRAME_HEADER_SIZE;
+            size_t dataLength = packetLength - DATA_PACKET_HEADER_SIZE;
             if (dataLength > fileSize - bytesWritten) {
                 fprintf(stderr, "DATA exceeds the advertised file size.\n");
                 break;
             }
-            if (fwrite(packet + FRAME_HEADER_SIZE, 1, dataLength, file) != dataLength) {
+            if (fwrite(packet + DATA_PACKET_HEADER_SIZE, 1, dataLength, file) != dataLength) {
                 fprintf(stderr, "Failed to write output file.\n");
                 break;
             }

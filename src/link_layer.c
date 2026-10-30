@@ -36,16 +36,16 @@
 
 #define ESC 0x7D
 #define ESCAPED_FLAG (FLAG ^ 0x20)
-#define ESCAPED_ESCAPED (ESC ^ 0x20)
+#define ESCAPED_ESC (ESC ^ 0x20)
 
 
 static volatile sig_atomic_t alarmEnabled = FALSE;
 static volatile sig_atomic_t alarmCount = 0;
 
-static int rxSequence = 0;
+static int expectedRxSequence = 0;
 static int txSequence = 0;
 static int savedTimeout = 0;
-static int savedRetries = 0;
+static int maxRetransmissions = 0;
 
 typedef enum {
     START,
@@ -113,7 +113,7 @@ static int writeSupervisionFrame(unsigned char address, unsigned char control) {
 }
 
 // Parse a complete supervision frame using the expected address.
-static void supervisionFrameParser(unsigned char byte, unsigned char address, SupervisionFrameParser *parser) {
+static void parseSupervisionFrameByte(unsigned char byte, unsigned char address, SupervisionFrameParser *parser) {
     switch (parser->state)
     {
         case START:
@@ -156,7 +156,7 @@ static int stuffByte(unsigned char byte, unsigned char *output) {
         return 2;
     } else if (byte == ESC) {
         output[0] = ESC;
-        output[1] = ESCAPED_ESCAPED;
+        output[1] = ESCAPED_ESC;
         return 2;
     }
 
@@ -169,7 +169,7 @@ static int destuffByte(unsigned char byte, unsigned char *output, int *escaped) 
     if (*escaped)
     {
         *escaped = 0;
-        if (byte != ESCAPED_FLAG && byte != ESCAPED_ESCAPED)
+        if (byte != ESCAPED_FLAG && byte != ESCAPED_ESC)
             return -1;
         *output = byte ^ 0x20;
         return 1;
@@ -189,8 +189,9 @@ static int destuffByte(unsigned char byte, unsigned char *output, int *escaped) 
   its XOR checksum, and validate BCC2 when the closing flag arrives.
   Update the parser state to finish the frame or discard a malformed body.
 */
-static void infoBodyByteParser(unsigned char byte, IFrameParser *parser) {
+static void parseIFrameDataByte(unsigned char byte, IFrameParser *parser) {
     unsigned char decoded;
+    
     // An unescaped flag ends the body; payload XOR received BCC2 must be zero.
     if (byte == FLAG && !parser->escaped) {
         parser->valid = (parser->dataLength >= 1 && parser->bcc2 == 0);
@@ -232,7 +233,7 @@ static void infoBodyByteParser(unsigned char byte, IFrameParser *parser) {
 }
 
 // Parses information frames.
-static void iFrameParser(unsigned char byte, IFrameParser *parser) {
+static void parseIFrameByte(unsigned char byte, IFrameParser *parser) {
     State *state = &parser->state;
 
     switch (*state)
@@ -265,7 +266,7 @@ static void iFrameParser(unsigned char byte, IFrameParser *parser) {
             else *state = START;
             break;
         case DATA_RCV: 
-            infoBodyByteParser(byte, parser);
+            parseIFrameDataByte(byte, parser);
             break; 
         case DISCARD_DATA:
             // Drain the damaged body before asking for retransmission.
@@ -312,7 +313,7 @@ static int waitForSupervisionReply(unsigned char address, unsigned char expected
             return -1;
         }
         if (bytes == 0) continue;
-        supervisionFrameParser(byte, address, &parser);
+        parseSupervisionFrameByte(byte, address, &parser);
         if (parser.state == STOP && parser.control != expectedControl && parser.control != alternativeControl)
             parser.state = START;
     }
@@ -323,7 +324,7 @@ static int waitForSupervisionReply(unsigned char address, unsigned char expected
 // Active exchanges resend a control frame after each timeout.
 static int exchangeSupervisionFrames(unsigned char sendAddress, unsigned char control,
                                      unsigned char replyAddress, unsigned char expectedControl) {
-    for (int att = 0; att <= savedRetries; att++) {
+    for (int att = 0; att <= maxRetransmissions; att++) {
         if (writeSupervisionFrame(sendAddress, control) < 0) return -1;
         int ret = waitForSupervisionReply(replyAddress, expectedControl, NO_ALT_CTRL);
         if (ret == expectedControl || ret == -1) return ret;
@@ -343,7 +344,7 @@ int llOpenTx(LinkLayer llParameters) {
     }
 
     savedTimeout = llParameters.timeout;
-    savedRetries = llParameters.nRetransmissions;
+    maxRetransmissions = llParameters.nRetransmissions;
     txSequence = 0;
 
     printf("Serial port %s opened\n", llParameters.serialPort);
@@ -364,12 +365,12 @@ int llOpenRx(LinkLayer llParameters)
     }
 
     savedTimeout = llParameters.timeout;
-    savedRetries = llParameters.nRetransmissions;
+    maxRetransmissions = llParameters.nRetransmissions;
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
     int ret = -2;
-    for (int att = 0; att <= savedRetries && ret == -2; att++)
+    for (int att = 0; att <= maxRetransmissions && ret == -2; att++)
         ret = waitForSupervisionReply(A_TX, SET, NO_ALT_CTRL);
     if (ret != SET) {
         closeSerialPort();
@@ -382,7 +383,7 @@ int llOpenRx(LinkLayer llParameters)
     }
 
     printf("SET received; UA sent\n");
-    rxSequence = 0;
+    expectedRxSequence = 0;
 
     return 0;
 }
@@ -420,7 +421,7 @@ int llSend(const unsigned char *buf, int bufSize)
     unsigned char okResponse = (txSequence == 0) ? RR1 : RR0;
     unsigned char rejectResponse = (txSequence == 0) ? REJ0 : REJ1;
 
-    for (int att = 0; att <= savedRetries; att++) {
+    for (int att = 0; att <= maxRetransmissions; att++) {
         int written = 0;
         while (written < n) {
             int bytes = writeBytesSerialPort(frame + written, n - written);
@@ -466,26 +467,26 @@ int llReceive(unsigned char *packet) {
                 return -1;
             }
             if (bytes == 0) continue;
-            iFrameParser(byte, &parser);
+            parseIFrameByte(byte, &parser);
         }
 
         int receivedSequence = parser.control == I1;
-        int isNew = receivedSequence == rxSequence;
+        int isNew = receivedSequence == expectedRxSequence;
 
         if (!parser.valid && isNew) {
-            unsigned char rej = rxSequence == 0 ? REJ0 : REJ1;
+            unsigned char rej = expectedRxSequence == 0 ? REJ0 : REJ1;
             if (writeSupervisionFrame(A_TX, rej) < 0) return -1;
             continue;
         }
 
-        int nextExpected = isNew ? (rxSequence ^ 1) : rxSequence;
+        int nextExpected = isNew ? (expectedRxSequence ^ 1) : expectedRxSequence;
         unsigned char rr = nextExpected == 0 ? RR0 : RR1;
         if (writeSupervisionFrame(A_TX, rr) < 0) return -1;
 
         // Acknowledge duplicates without delivering the payload twice.
         if (!isNew) continue;
 
-        rxSequence = nextExpected;
+        expectedRxSequence = nextExpected;
         memcpy(packet, parser.data, parser.dataLength);
         return parser.dataLength;
     }
@@ -516,7 +517,7 @@ int llCloseTx()
 int llCloseRx()
 {
     int ret = -2;
-    for (int att = 0; att <= savedRetries && ret == -2; att++)
+    for (int att = 0; att <= maxRetransmissions && ret == -2; att++)
         ret = waitForSupervisionReply(A_TX, DISC, NO_ALT_CTRL);
     if (ret != DISC) {
         closeSerialPort();
