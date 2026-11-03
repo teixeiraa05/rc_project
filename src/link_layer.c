@@ -482,10 +482,12 @@ int llSend(const unsigned char *buf, int bufSize)
         if (ret == -1) return -1;
 
         if (ret == okResponse) {            // acknowledged
+            printf("RR%d received\n", ret == RR1 ? 1 : 0);
             txSequence ^= 1;
             statistics.payloadBytes += bufSize;
             return bufSize;
         }
+        if (ret == rejectResponse) printf("REJ%d received\n", ret == REJ1? 1 : 0);
         // Timeout or matching REJ: retransmit.
     }
 
