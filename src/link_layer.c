@@ -554,7 +554,7 @@ int llReceive(unsigned char *packet) {
 int llCloseTx()
 {
     int result = -1;
-    if (exchangeSupervisionFrames(A_TX, DISC, A_RX, DISC) == DISC &&
+    if (exchangeSupervisionFrames(A_TX, DISC, A_TX, DISC) == DISC &&
         writeSupervisionFrame(A_RX, UA) == 0)
         result = 0;
 
@@ -574,7 +574,7 @@ int llCloseRx()
         ret = waitForSupervisionReply(A_TX, DISC, NO_ALT_CTRL);
 
     int result = -1;
-    if (ret == DISC && exchangeSupervisionFrames(A_RX, DISC, A_RX, UA) == UA)
+    if (ret == DISC && exchangeSupervisionFrames(A_TX, DISC, A_RX, UA) == UA)
         result = 0;
 
     if (closeSerialPort() < 0) {
