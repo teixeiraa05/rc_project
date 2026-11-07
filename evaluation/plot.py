@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 import json
 from pathlib import Path
 from run import (configurations, repetitions_for, SWEEPS, MAX_PAYLOAD_SIZE,
-                 FILE_CHUNK_SIZES, configuration_key)
+                 FILE_CHUNK_SIZES, REFERENCE_CHUNK_SIZE, configuration_key, seed_for)
 import math
 import statistics
 
@@ -26,15 +26,26 @@ def theoretical_efficiencies(row):
     fer = float(row["fer"])
     file_bytes = int(row["file_bytes"])
     chunk_bytes = int(row["payload_bytes"])
+    start_bytes = float(row["start_frame_bytes"])
+    end_bytes = float(row["end_frame_bytes"])
     if (not all(math.isfinite(v) for v in (capacity, frame_bytes, propagation, fer))
             or capacity <= 0 or frame_bytes <= 0 or propagation < 0 or not 0 <= fer < 1
-            or file_bytes <= 0 or chunk_bytes <= 0):
+            or file_bytes <= 0 or chunk_bytes <= 0
+            or not all(math.isfinite(v) and v >= 6 for v in (start_bytes, end_bytes))):
         raise ValueError("Invalid Stop-and-Wait model parameters")
     frames = math.ceil(file_bytes / chunk_bytes)
     # RR and REJ supervision frames contain five bytes.
     cycle = 10 * (frame_bytes + 5) / capacity + 2 * propagation
-    clean = 8 * file_bytes / (capacity * frames * cycle)
-    return (1 - fer) * clean, clean
+    opening = 100 / capacity + 2 * propagation
+    closing = 150 / capacity + 3 * propagation
+    start = 10 * (start_bytes + 5) / capacity + 2 * propagation
+    end = 10 * (end_bytes + 5) / capacity + 2 * propagation
+    information = start + frames * cycle + end
+    clean_time = opening + information + closing
+    # Ideal class model: clean handshakes, equal-duration attempts, unlimited retries.
+    predicted_time = opening + information / (1 - fer) + closing
+    clean = 8 * file_bytes / (capacity * clean_time)
+    return 8 * file_bytes / (capacity * predicted_time), clean
 
 
 def summarize(rows):
@@ -84,7 +95,7 @@ def plots(groups, names=("capacity", "frame-size", "a", "fer")):
     ASSETS.mkdir(parents=True, exist_ok=True)
     plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False,
                          "axes.grid": True, "grid.alpha": 0.2})
-    baseline = [g for g in groups if g["capacity"] == 9600 and g["chunk_size"] == 512]
+    baseline = [g for g in groups if g["capacity"] == 9600 and g["chunk_size"] == REFERENCE_CHUNK_SIZE]
     for name in names:
         fig, ax = plt.subplots(figsize=(4.5, 3))
         if name == "fer":
@@ -98,19 +109,20 @@ def plots(groups, names=("capacity", "frame-size", "a", "fer")):
         else:
             selected = [g for g in groups if g["delay"] == 0 and g["fer"] == 0]
             if name == "capacity":
-                selected = [g for g in selected if g["chunk_size"] == 512]
-                x = lambda g: g["capacity"] / 1000
-                ax.set(xlabel=r"Link capacity $C$ (kbit/s)", ylim=(72, 80))
+                selected = [g for g in selected if g["chunk_size"] == REFERENCE_CHUNK_SIZE]
+                x = lambda g: g["capacity"]
+                ax.set(xlabel=r"Link capacity $C$ (bit/s)", ylim=(72, 80))
                 capacities = sorted({x(g) for g in selected})
                 ax.set_xscale("log", base=2)
-                ax.set_xticks(capacities, labels=[f"{c:g}" for c in capacities])
+                ax.set_xticks(capacities, labels=[f"{c:,}" for c in capacities], rotation=45, ha="right")
+                ax.minorticks_off()
             else:
                 selected = [g for g in selected if g["capacity"] == 9600
                             and g["chunk_size"] in FILE_CHUNK_SIZES]
-                x = lambda g: g["chunk_size"] + 3
-                ax.set(xlabel="DATA packet size (bytes)", ylim=(0, 103))
-                sizes = [g["chunk_size"] + 3 for g in selected]
-                ax.set_xticks(sizes, labels=[f"{size:g}" for size in sizes], rotation=45, ha="right")
+                x = lambda g: g["chunk_size"] + 9
+                ax.set(xlabel=r"Frame size $L$ (bytes, before stuffing)", ylim=(0, 103))
+                sizes = sorted(x(g) for g in selected)
+                ax.set_xticks(sizes, labels=[f"{size:.1f}".removesuffix(".0") for size in sizes], rotation=45, ha="right")
         curve(ax, selected, x)
         ax.set_ylabel(r"Efficiency $S$ (%)")
         ax.legend(fontsize=8, loc="lower left")
@@ -126,10 +138,10 @@ def write_report_metadata(rows, groups):
     current = Counter(map(configuration_key, rows)) == {c: repetitions_for(c) for c in expected}
     values = {"total": len(rows), "passed": sum(r["status"] == "ok" for r in rows),
               "current": current, "planned_total": sum(repetitions_for(c) for c in expected)}
-    cases = {"baseline": (9600, 0, 512, 0), "low": (1800, 0, 512, 0),
-             "high": (38400, 0, 512, 0), "small": (9600, 0, 61, 0),
-             "large": (9600, 0, 997, 0), "delay": (9600, 100000, 512, 0),
-             "fer": (9600, 0, 512, .2)}
+    cases = {"baseline": (9600, 0, REFERENCE_CHUNK_SIZE, 0), "low": (1800, 0, REFERENCE_CHUNK_SIZE, 0),
+             "high": (38400, 0, REFERENCE_CHUNK_SIZE, 0), "small": (9600, 0, FILE_CHUNK_SIZES[0], 0),
+             "large": (9600, 0, FILE_CHUNK_SIZES[-1], 0), "delay": (9600, 100000, REFERENCE_CHUNK_SIZE, 0),
+             "fer": (9600, 0, REFERENCE_CHUNK_SIZE, .2)}
     for name, config in cases.items():
         group = groups.get(config)
         good = group is not None and group["efficiency"] is not None
@@ -160,12 +172,12 @@ def write_report_metadata(rows, groups):
 def write_summary_table(rows, groups):
     grouped = {tuple(g[k] for k in ("capacity", "delay", "chunk_size", "fer")): g for g in groups}
     cases = [
-        ("Reference", (9600, 0, 512, 0)),
-        ("38,400 bit/s", (38400, 0, 512, 0)),
-        ("64-byte DATA packet", (9600, 0, 61, 0)),
-        ("25 ms added delay", (9600, 25000, 512, 0)),
-        ("100 ms added delay", (9600, 100000, 512, 0)),
-        ("20% target FER", (9600, 0, 512, .2)),
+        ("Reference", (9600, 0, REFERENCE_CHUNK_SIZE, 0)),
+        ("38,400 bit/s", (38400, 0, REFERENCE_CHUNK_SIZE, 0)),
+        ("64-byte frame", (9600, 0, FILE_CHUNK_SIZES[0], 0)),
+        ("25 ms added delay", (9600, 25000, REFERENCE_CHUNK_SIZE, 0)),
+        ("100 ms added delay", (9600, 100000, REFERENCE_CHUNK_SIZE, 0)),
+        ("20% target FER", (9600, 0, REFERENCE_CHUNK_SIZE, .2)),
     ]
     cells = []
     for label, config in cases:
@@ -186,7 +198,7 @@ def write_summary_table(rows, groups):
   table(
     columns: (2fr, 1fr, 1.2fr, 1fr, 1fr),
     align: (left, center, center, center, center),
-    inset: (x: 6pt, y: 6pt),
+    inset: (x: 6pt, y: 4pt),
     stroke: 0.4pt,
     fill: (_, row) => if row == 0 { rgb("#eeeeee") },
     table.header([*Setting*], [*Time (s)*], [*$R$ (kbit/s)*], [*$S$*], [*OK / runs*]),
@@ -195,7 +207,7 @@ def write_summary_table(rows, groups):
   kind: table,
   caption: [Representative results, averaged over successful trials.
     Across all configurations, {successful} of {len(rows)} transfers completed correctly.
-    Reference: 9600 bit/s, 512-byte file payload, no added propagation delay, FER 0%.],
+    Reference: 9,600 bit/s, 512-byte frame before stuffing, no added propagation delay, FER 0%.],
 ) <results-summary>
 """
     ASSETS.mkdir(parents=True, exist_ok=True)
@@ -211,10 +223,13 @@ def main():
         rows = list(csv.DictReader(file))
     if any(int(row["max_payload"]) != MAX_PAYLOAD_SIZE for row in rows):
         raise ValueError("Results used a different link-layer limit; rerun with fixed MAX_PAYLOAD_SIZE")
+    if any(int(row["seed"]) != seed_for(configuration_key(row), int(row["repetition"]))
+           for row in rows):
+        raise ValueError("Results contain an unexpected trial seed")
     expected = set(configurations(sweep))
     actual = set(map(configuration_key, rows))
     if len(rows) != sum(repetitions_for(c) for c in expected) or actual != expected:
-        raise ValueError("Expected current packet sizes and 20 FER trials / five other trials; rerun the evaluation")
+        raise ValueError("Expected current profiles with 20 trials per configuration; rerun the evaluation")
     for config in expected:
         trials = [r for r in rows if configuration_key(r) == config]
         if len(trials) != repetitions_for(config) or {int(r["repetition"]) for r in trials} != set(range(1, repetitions_for(config) + 1)):

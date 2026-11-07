@@ -4,6 +4,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
+import hashlib
 import importlib.util
 import math
 import os
@@ -19,10 +20,15 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 HERE = Path(__file__).resolve().parent
-REPETITIONS, FER_REPETITIONS, TIME_LIMIT = 5, 20, 600
-PACKET_SIZES = (64, 128, 256, 512, 1000)
+REPETITIONS, TIME_LIMIT = 20, 600
+BASE_SEED = 20261104
+FRAME_SIZES = (64, 128, 256, 512, 1000)
+PACKET_SIZES = tuple(size - 6 for size in FRAME_SIZES)
 FILE_CHUNK_SIZES = tuple(size - 3 for size in PACKET_SIZES)
-INPUT_DATA = bytes(range(256)) * 16
+REFERENCE_FRAME_SIZE = 512
+REFERENCE_PACKET_SIZE = REFERENCE_FRAME_SIZE - 6
+REFERENCE_CHUNK_SIZE = REFERENCE_PACKET_SIZE - 3
+INPUT_DATA = bytes(range(256)) * 64
 MAX_PAYLOAD_SIZE = 1000
 SWEEPS = {"fer": "fer", "delay": "a", "baud": "capacity", "packet_size": "frame-size"}
 
@@ -30,26 +36,32 @@ SWEEPS = {"fer": "fer", "delay": "a", "baud": "capacity", "packet_size": "frame-
 def configurations(sweep=None):
     # C (bit/s), requested one-way propagation (us), FILE_CHUNK_SIZE, FER.
     clean = ([(9600, 0, payload, 0.0) for payload in FILE_CHUNK_SIZES]
-             + [(capacity, 0, 512, 0.0) for capacity in (1800, 2400, 4800, 9600, 19200, 38400)])
-    sweeps = ([(9600, 0, 512, fer) for fer in (0, 0.025, 0.05, 0.1, 0.15, 0.2)]
-              + [(9600, delay, 512, 0.0) for delay in (0, 10000, 25000, 50000, 100000)]
-              + [(capacity, 0, 512, 0.05) for capacity in (1800, 2400, 4800, 9600, 19200, 38400)]
-              + [(9600, 0, payload, 0.05) for payload in FILE_CHUNK_SIZES])
+             + [(capacity, 0, REFERENCE_CHUNK_SIZE, 0.0) for capacity in (1800, 2400, 4800, 9600, 19200, 38400)])
+    sweeps = ([(9600, 0, REFERENCE_CHUNK_SIZE, fer) for fer in (0, 0.025, 0.05, 0.1, 0.15, 0.2)]
+              + [(9600, delay, REFERENCE_CHUNK_SIZE, 0.0) for delay in (0, 10000, 25000, 50000, 100000)]
+              )
     configs = list(dict.fromkeys(clean + sweeps))
     if sweep is None:
         return configs
     predicates = {
-        "fer": lambda c: c[0] == 9600 and c[1] == 0 and c[2] == 512,
-        "delay": lambda c: c[0] == 9600 and c[2] == 512 and c[3] == 0,
-        "baud": lambda c: c[1] == 0 and c[2] == 512 and c[3] in (0, .05),
+        "fer": lambda c: c[0] == 9600 and c[1] == 0 and c[2] == REFERENCE_CHUNK_SIZE,
+        "delay": lambda c: c[0] == 9600 and c[2] == REFERENCE_CHUNK_SIZE and c[3] == 0,
+        "baud": lambda c: c[1] == 0 and c[2] == REFERENCE_CHUNK_SIZE and c[3] == 0,
         "packet_size": lambda c: c[0] == 9600 and c[1] == 0
-                         and c[2] in FILE_CHUNK_SIZES and c[3] in (0, .05),
+                         and c[2] in FILE_CHUNK_SIZES and c[3] == 0,
     }
     return [c for c in configs if predicates[sweep](c)]
 
 
 def repetitions_for(config):
-    return FER_REPETITIONS if config in configurations("fer") else REPETITIONS
+    return REPETITIONS
+
+
+def seed_for(config, repetition, base_seed=None):
+    if base_seed is None:
+        base_seed = BASE_SEED
+    key = f"{base_seed}:{config}:{repetition}".encode()
+    return int.from_bytes(hashlib.sha256(key).digest()[:4], "big")
 
 
 def ber_for_fer(fer, frame_bytes):
@@ -80,6 +92,8 @@ static double eval_now(void) {
                           '    if (bufSize > 0 && buf[0] == 2) {\n'
                           '        if (eval_start == 0) eval_start = eval_now();\n'
                           '        printf("EVAL_FRAME %d %d\\n", bufSize - 3, n);\n'
+                          '    } else if (bufSize > 0 && (buf[0] == 1 || buf[0] == 3)) {\n'
+                          '        printf("EVAL_CONTROL %d %d\\n", buf[0], n);\n'
                           '    }\n    unsigned char okResponse =')
     source = replace_once(source, '            txSequence ^= 1;',
                           '            if (bufSize > 0 && buf[0] == 2) eval_end = eval_now();\n'
@@ -194,15 +208,19 @@ def transfer(folder, config, repetition, actual_delay, ber, reference_frame_byte
             stop(process)
     frames = [tuple(map(int, line.split()[1:])) for line in tx_lines if line.startswith("EVAL_FRAME ")]
     intervals = [float(line.split()[1]) for line in tx_lines if line.startswith("EVAL_DATA ")]
+    controls = {int(line.split()[1]): int(line.split()[2]) for line in tx_lines
+                if line.startswith("EVAL_CONTROL ")}
     duration = intervals[-1] if status == "ok" and intervals else None
     if status == "ok":
         assert duration and duration > 0 and sum(k for k, _ in frames) == len(data)
     return dict(capacity_bps=capacity, endpoint_baud=9600, requested_prop_us=delay,
                 actual_prop_us=actual_delay, max_payload=MAX_PAYLOAD_SIZE, payload_bytes=chunk_size,
+                nominal_frame_bytes=chunk_size + 9,
                 fer=fer, ber=ber, reference_frame_bytes=reference_frame_bytes,
-                repetition=repetition, input_file=source.name,
+                repetition=repetition, seed=seed_for(config, repetition), input_file=source.name,
                 file_bytes=len(data), status=status, transfer_s=elapsed, data_s=duration or "",
                 mean_frame_bytes=sum(w for _, w in frames) / len(frames) if frames else "",
+                start_frame_bytes=controls.get(1, ""), end_frame_bytes=controls.get(3, ""),
                 full_frame_bytes=(sum(full) / len(full) if (full := [w for k, w in frames
                                   if k == chunk_size]) else ""))
 
@@ -221,6 +239,24 @@ def split_results(results):
 
 def private_cable_source(folder):
     source = (ROOT / "cable/cable.c").read_text()
+    source = replace_once(source, '    int STOP = FALSE;',
+                          '    unsigned int eval_tx_seed = 1, eval_rx_seed = 2;\n'
+                          '    int STOP = FALSE;')
+    source = replace_once(source, '            else if (strncmp(rxStdin, "ber ", 4) == 0)',
+                          '            else if (strncmp(rxStdin, "seed ", 5) == 0) {\n'
+                          '                unsigned int seed;\n'
+                          '                if (sscanf(rxStdin + 5, "%u", &seed) == 1) {\n'
+                          '                    eval_tx_seed = seed;\n'
+                          '                    eval_rx_seed = seed ^ 0x9e3779b9U;\n'
+                          '                    printf("SEED SET TO %u\\n", seed);\n'
+                          '                }\n'
+                          '            }\n'
+                          '            else if (strncmp(rxStdin, "ber ", 4) == 0)')
+    # Independent streams keep faults per direction independent of thread scheduling.
+    if source.count('rand()') != 4:
+        raise ValueError("Cable random-number hooks no longer match")
+    for direction in ('tx', 'tx', 'rx', 'rx'):
+        source = source.replace('rand()', f'rand_r(&eval_{direction}_seed)', 1)
     for macro, port in (("TXDEV", "tx"), ("RXDEV", "rx"),
                         ("TX_EMULATOR", "tx-link"), ("RX_EMULATOR", "rx-link")):
         source, count = re.subn(rf'(?m)^#define {macro} "[^"\n]+"$',
@@ -265,9 +301,11 @@ def run_configurations(configs, results, label, cancelled, references, repetitio
                     cable_command(cable, cable_lines, f"baud {capacity}")
                     actual_delay = cable_command(cable, cable_lines, f"prop {delay}")
                     for repetition in repetitions:
+                        seed = seed_for(config, repetition)
+                        cable_command(cable, cable_lines, f"seed {seed}", r"SEED SET TO (\d+)")
                         completed += 1
                         print(f"[{label} {completed}/{total}] C={capacity}, "
-                              f"delay={delay / 1000:g}ms, CHUNK={chunk_size}, FER={fer:.1%}", flush=True)
+                              f"delay={delay / 1000:g}ms, L={chunk_size + 9}, CHUNK={chunk_size}, FER={fer:.1%}, seed={seed}", flush=True)
                         row = transfer(folder, config, repetition, actual_delay, ber, reference, cancelled)
                         if not fer and row["status"] == "ok" and row["full_frame_bytes"]:
                             reference_lengths.setdefault(chunk_size, row["full_frame_bytes"])
@@ -305,7 +343,7 @@ def parallel_jobs(configs):
     return sorted(jobs, key=lambda job: sum(1 / c[0] for c in job[1]), reverse=True)
 
 
-def run_parallel(configs, results, previous_rows=()):
+def run_parallel(configs, results, previous_rows=(), workers=16):
     cancelled = threading.Event()
     complete, references = {}, {}
     for config in configs:
@@ -318,7 +356,7 @@ def run_parallel(configs, results, previous_rows=()):
     pending = [c for c in configs if c not in complete]
     with tempfile.TemporaryDirectory(prefix="rc-eval-results-") as temporary:
         parts = []
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = []
             try:
                 for label, selected in parallel_jobs(pending):
@@ -354,7 +392,17 @@ def main():
     configs = configurations()
     assert len(configs) == len(set(configs))
     results = HERE / "results.csv"
-    run_parallel(configs, results)
+    previous = []
+    if results.exists():
+        with results.open() as file:
+            previous = [r for r in csv.DictReader(file)
+                        if r.get("seed") and r.get("start_frame_bytes") and r.get("end_frame_bytes")
+                        and r.get("nominal_frame_bytes") == str(int(r["payload_bytes"]) + 9)
+                        and r.get("max_payload") == str(MAX_PAYLOAD_SIZE)
+                        and r.get("file_bytes") == str(len(INPUT_DATA))
+                        and r.get("input_file") == "sample.bin"
+                        and int(r["seed"]) == seed_for(configuration_key(r), int(r["repetition"]))]
+    run_parallel(configs, results, previous)
     split_results(results)
     subprocess.run([sys.executable, str(HERE / "plot.py")], check=True)
     print(f"Finished: {results}", flush=True)

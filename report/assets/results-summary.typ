@@ -3,19 +3,18 @@
   table(
     columns: (2fr, 1fr, 1.2fr, 1fr, 1fr),
     align: (left, center, center, center, center),
-    inset: (x: 6pt, y: 6pt),
+    inset: (x: 6pt, y: 4pt),
     stroke: 0.4pt,
     fill: (_, row) => if row == 0 { rgb("#eeeeee") },
     table.header([*Setting*], [*Time (s)*], [*$R$ (kbit/s)*], [*$S$*], [*OK / runs*]),
-    [Reference], [4.56], [7.18], [74.8%], [20 / 20],
-    [38,400 bit/s], [1.15], [28.60], [74.5%], [5 / 5],
-    [64-byte DATA packet], [5.44], [6.03], [62.8%], [5 / 5],
-    [25 ms added delay], [5.19], [6.32], [65.8%], [5 / 5],
-    [100 ms added delay], [7.06], [4.64], [48.4%], [5 / 5],
-    [20% target FER], [5.39], [6.08], [63.3%], [20 / 20],
+    [Reference], [17.93], [7.31], [76.1%], [20 / 20],
+    [38,400 bit/s], [4.56], [28.77], [74.9%], [20 / 20],
+    [64-byte frame], [22.21], [5.90], [61.5%], [20 / 20],
+    [25 ms added delay], [19.80], [6.62], [69.0%], [20 / 20],
+    [100 ms added delay], [25.43], [5.15], [53.7%], [20 / 20],
+    [20% target FER], [23.74], [5.52], [57.5%], [18 / 20],
   ),
   kind: table,
   caption: [Representative results, averaged over successful trials.
-    Across all configurations, 240 of 240 transfers completed correctly.
-    Reference: 9600 bit/s, 512-byte file payload, no added propagation delay, FER 0%.],
+    Reference: 9,600 bit/s, 512-byte frame before stuffing, no added propagation delay, FER 0%.],
 ) <results-summary>

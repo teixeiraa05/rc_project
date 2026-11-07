@@ -14,7 +14,7 @@
 #set par(justify: true, leading: 0.5em, spacing: 1.15em)
 #set heading(numbering: none)
 #show heading: set text(size: 11pt, weight: "bold")
-#show heading: set block(above: 1.1em, below: 0.9em)
+#show heading: set block(above: 1em, below: 1em)
 #set figure(gap: 8pt)
 #show figure: set block(above: 18pt, below: 18pt)
 #show math.equation.where(block: true): set block(above: 0.75em, below: 0.75em)
@@ -40,26 +40,31 @@
     column-gutter: 5mm,
     [
       *Rodrigo Fernandes Teixeira* \
-      #link("mailto:up202404802@up.pt")[up202404802\@up.pt]
+      up202404802\@up.pt
     ],
     [
       *Nuno João Pires Carvalho* \
-      #link("mailto:up202406771@up.pt")[up202406771\@up.pt]
+      up202406771\@up.pt
     ],
   )
   #v(1mm)
-  *Practical class:* 3LEIC02 #h(1fr) 27 October 2026
+  *Practical class:* 3LEIC02 #h(1fr) 4 November 2026
 ]
 
 #v(5mm)
 
 = Summary
-This study characterises a Stop-and-Wait protocol through #results.total file
-transfers over a virtual serial link. Of these, #results.passed delivered the
-4096-byte file correctly. With zero FER and no added propagation delay,
-useful-file efficiency was #results.baseline_eff at 9600 bit/s with 512-byte file
-payloads. At 100 ms added one-way delay, efficiency was #results.delay_eff.
-The results are compared with the ideal Stop-and-Wait model.
+This report measures the efficiency of our Stop-and-Wait data-link protocol and
+compares it with a theoretical full-transfer model. Of #results.total transfers
+of a 16,384-byte file, #results.passed delivered the file correctly. In the
+reference configuration (9,600 bit/s, 512-byte frames), measured efficiency was
+#results.baseline_eff against #results.baseline_theory predicted. Increasing the
+frame size from 64 to 1,000 bytes raised efficiency from #results.small_eff to
+#results.large_eff, while capacities from 1,800 to 38,400 bit/s kept it between
+#results.high_eff and #results.low_eff. A 100 ms propagation delay lowered it to
+#results.delay_eff, and a 20% target Frame Error Rate (FER) to #results.fer_eff.
+Without errors, the model stayed within 1.7 percentage points of every
+measurement; at 20% FER, it exceeded the measurement by 3.8 points.
 
 #if not results.current [
   #text(size: 10pt)[*Measurement update pending:* The updated plan below requires
@@ -69,26 +74,41 @@ The results are compared with the ideal Stop-and-Wait model.
 
 
 = Introduction
-Stop-and-Wait provides reliable communication by acknowledging each frame before
-sending the next. The implemented serial protocol combines framing, byte
-stuffing, checksums, alternating sequence numbers and retransmissions. Its
-performance depends on the time spent carrying useful data relative to framing,
-acknowledgements and recovery. This study examines the effects of link capacity,
-frame size, propagation delay and frame error rate on useful throughput.
+Our program transfers files over an RS-232 serial link using two independent
+layers. The application layer splits the file into DATA packets, sends them
+between START and END control packets, and rebuilds the file at the receiver.
+It passes each packet to the link layer, which carries it in an information (I)
+frame without interpreting the application contents. The link layer handles
+framing, byte stuffing and error detection, then delivers each accepted packet
+to the receiving application.
+
+The link layer uses Stop-and-Wait Automatic Repeat Request (ARQ) to recover
+from errors. After each I frame, the transmitter waits for a reply. Replies
+confirm reception (RR/REJ) or request retransmission; a timeout also
+triggers retransmission. Sequence numbers alternate between 0 and 1 so the
+receiver can acknowledge duplicates without passing them to the application twice.
+Waiting for replies reduces the time available to send file data. 
+
+We vary capacity $C$, frame size $L$, propagation delay $T_"prop"$ and FER,
+one at a time, and compare the measured full-transfer efficiency $S$.
 
 = Methodology
-The updated evaluation has 30 configurations, each transferring the same
-4096-byte file. Each of the six FER settings runs 20 times; the remaining 24
-configurations run five times, for #results.planned_total transfers in total.
-Shared configurations are counted once; the reference and 5% FER baseline
-therefore retain their 20 trials when used in other comparisons.
-The virtual cable controls capacity, added one-way propagation delay and bit
-errors; endpoint serial settings remain at 9600 bit/s. The link-layer payload
-limit stays at 1000 bytes. The size sweep uses application DATA packets of
-64, 128, 256, 512 and 1000 bytes, including the three-byte header, giving file
-chunks of 61, 125, 253, 509 and 997 bytes. The implementation uses a four-second
-timeout and three retransmissions. The figures use the profiles in @sweeps;
-capacity and packet-size comparisons use error-free trials with no added delay.
+Each of the 19 unique configurations in @sweeps is tested in 20 repeated file
+transfers: #results.planned_total trials, all using the same 16,384-byte file.
+Results for shared configurations are reused across figures and tables.
+Trials were run concurrently using threads.
+
+The evaluator connects transmitter and receiver through the virtual cable and
+starts the receiver before the transmitter. As stated before, the same file is used throughout
+so that differences reflect transmission conditions rather than file contents.
+
+The cable sets the link capacity, delay and errors, while both endpoint serial
+ports keep a baud rate of 9,600 bit/s.
+The serial port uses ten bits per byte (8N1).
+The protocol uses a four-second timeout and three retries.
+
+For I frames carrying DATA packets, $L=P+6$, where $P$ is the complete application
+DATA packet size. Table values are nominal sizes before stuffing.
 
 #figure(
   table(
@@ -98,61 +118,58 @@ capacity and packet-size comparisons use error-free trials with no added delay.
     stroke: 0.4pt,
     fill: (_, row) => if row == 0 { rgb("#eeeeee") },
     table.header([*Parameter*], [*Values*], [*Fixed conditions*]),
-    [Capacity $C$], [1.8, 2.4, 4.8, 9.6, 19.2, 38.4 kbit/s],
-    [$P=512$ bytes; $p_e=0$; $T_"prop"=0$ ms],
-    [DATA packet size], [64, 128, 256, 512, 1000 bytes],
-    [$C=9.6$ kbit/s; $p_e=0$; $T_"prop"=0$ ms],
-    [Propagation delay $T_"prop"$], [0, 10, 25, 50, 100 ms],
-    [$C=9.6$ kbit/s; $P=512$ bytes; $p_e=0$],
-    [Frame Error Rate ($p_e$)], [0%, 2.5%, 5%, 10%, 15%, 20%],
-    [$C=9.6$ kbit/s; $P=512$ bytes; $T_"prop"=0$ ms],
+    [Capacity $C$], [1,800; 2,400; 4,800; 9,600; 19,200; 38,400 bit/s],
+    [$L=512$ bytes; $p_e=0$; $T_"prop"=0$ ms],
+    [Frame size $L$], [64; 128; 256; 512; 1,000 bytes],
+    [$C$ = 9,600 bit/s; $p_e=0$; $T_"prop"=0$ ms],
+    [Propagation delay $T_"prop"$], [0; 10; 25; 50; 100 ms],
+    [$C$ = 9,600 bit/s; $L=512$ bytes; $p_e=0$],
+    [Frame Error Rate $p_e$], [0%; 2.5%; 5%; 10%; 15%; 20%],
+    [$C$ = 9,600 bit/s; $L=512$ bytes; $T_"prop"=0$ ms],
   ),
   kind: table,
-  caption: [Updated test profiles. $P$ denotes file payload. DATA packet sizes
-    include the three-byte application header; link framing and stuffing add wire overhead.],
+  caption: [Test profiles.],
 ) <sweeps>
 
-A DATA packet holds at most 1000 bytes. Its three-byte header leaves up to
-997 file bytes. The cable accepts a bit error rate (BER). To target FER $p_e$,
-we calculated $"BER"=1-(1-p_e)^(1/(8L))$ for each payload size, where $L$ is
-the mean full stuffed DATA-frame length in bytes measured in clean trials.
-This BER was applied in both directions, including acknowledgements. Stuffing
-variations and shorter frames change the actual FER.
-In the saved dataset, #results.passed of #results.total transfers passed
-byte-for-byte verification.
+The cable accepts Bit Error Rate (BER). We convert target FER using
+$"BER" = 1-(1-p_e)^(1/(8L))$. For this we use the measured length of full-sized I frames after byte stuffing, obtained from error-free transfers.
+Noise affects both directions,
+including replies; shorter I frames consequently have lower error probabilities.
+Added propagation delay also applies in each direction, separately from transmission time.
 
-For file size $B$ and full-transfer duration $T$, useful throughput was $R=8B/T$
-and measured efficiency was $S=R/C$. Duration included connection establishment,
-START/END packets, DATA, retransmissions and closure. Group throughput was the
-total useful bits divided by total duration across successful trials. Error bars
-represent approximate standard errors across successful repetitions.
+Throughput is $R=(8M)/T$ and efficiency is $S=R/C$, where $M$ is the file size
+in bytes and $T$ the transfer duration in seconds. $T$ runs from transmitter
+launch until both endpoints finish, covering opening, START, all I frames
+carrying DATA packets, END, retransmissions and closing. A trial succeeds only
+when both programs finish successfully and the received file matches the
+original byte for byte.
 
-#pagebreak()
+For each configuration, $T$ is the mean duration of its successful trials, and
+error bars show approximate standard errors of that mean. Completion counts
+include every trial, so the efficiency plots describe successful transfers and
+Table 2 reports reliability.
 
-= Theoretical Efficiency
-With stuffed DATA-frame length $L$ in bytes and capacity $C$, transmission time
-and normalised propagation delay are
-$ T_f=10L/C, quad a=T_"prop"/T_f. $
-For an error-free link,
-$ S_0=1/(1+2a). $
-The theoretical Stop-and-Wait efficiency is
-$ S=(1-p_e)/(1+2a), $
-where $p_e$ is the target FER and $a$ is the ratio of one-way propagation time
-to DATA-frame transmission time. BER is calculated from the target FER only to
-configure the cable for each payload size.
-
-The plotted prediction applies this Stop-and-Wait reasoning to useful-file
-throughput using the complete DATA/reply cycle. DATA transmission time is
-calculated from the recorded stuffed frame lengths and link capacity, with ten
-serial bits per byte. Each attempt also includes transmission of the five-byte
-reply and twice the one-way propagation time, accounting for the outward DATA
-and returning reply. The configured propagation time is included even when small;
-no additional baseline delay is assumed when the configured value is zero.
-The prediction counts only useful file bits and accounts for the number of DATA
-frames, including the short final frame. It uses the target FER for repeated
-attempts and does not use measured transfer durations. Setup/closure, START/END
-packets, processing, ACK corruption and four-second timeout waits remain outside
-this approximation.
+The class theoretical model counts successful frame-transmission time. With $a=T_"prop"/T_f$,
+$ S_"frame"=(1-p_e)/(1+2a) = ((1-p_e)T_f)/(T_f+2T_"prop") = T_f/E[T_"del"]. $
+Thus the ideal cycle and expected delivery time ($E[T_"del"]$) are
+$ T_"cycle"=T_f+2T_"prop", quad E[T_"del"] = T_"cycle"/(1-p_e). $
+With 8N1, $T_f=10L/C$. Including a five-byte reply, each I frame $j$ has
+$ T_"cycle"=T_f+T_"reply"+2T_"prop", quad
+  E[T_("del",j)] = (10(L_j+5)/C+2T_"prop")/(1-p_e). $
+Counting only I frames carrying DATA, $S_("file,DATA") = (8M)/(C sum_j E[T_("del",j)])$.
+Adding START/END delivery and both handshakes gives the expected full-transfer time:
+$ E[T_"transfer"] = E[T_"open"] + E[T_"START"] + sum_j E[T_("del",j)] + E[T_"END"] + E[T_"close"]. $
+#block(width: 100%, above: 0.75em, below: 0.75em)[
+  #align(center, box(stroke: 0.6pt, inset: 8pt)[
+    $display(S_"theory" = (8M)/(C E[T_"transfer"]))$
+  ])
+]
+The model uses recorded stuffed lengths, including the shorter final I frame
+carrying a DATA packet, and the measured propagation delay. It assumes clean
+handshakes, independent errors, equal-duration retries of each frame and
+unlimited attempts, and applies the target FER uniformly to I frames. It counts
+transmission and propagation time only; processing time, reply corruption and
+timeout waits fall outside it.
 
 = Results
 #grid(
@@ -160,68 +177,58 @@ this approximation.
   [#figure(image("assets/efficiency-capacity.svg", width: 100%),
     caption: [Effect of capacity $C$.]) <capacity>],
   [#figure(image("assets/efficiency-frame-size.svg", width: 100%),
-    caption: [#if results.current [Effect of DATA packet size.] else [Earlier size sweep; updated packet sizes pending.]]) <payload>],
+    caption: [Effect of frame size $L$.]) <frame-size>],
   [#figure(image("assets/efficiency-a.svg", width: 100%),
     caption: [Effect of delay $T_"prop"$.]) <delay>],
   [#figure(image("assets/efficiency-fer.svg", width: 100%),
-    caption: [Effect of FER ($p_e$).]) <fer>],
+    caption: [Effect of FER.]) <fer>],
 )
 
-Figures 1–4 compare measured efficiency, with approximate standard errors,
-against the ideal Stop-and-Wait reference (dashed). Fixed conditions are in @sweeps.
+Figures 1–4 show measured means with standard-error bars and theory as dashed
+lines; @sweeps lists the settings.
 
-*Capacity: the reference counts different overheads.* Useful throughput rose
-from #results.low_rate to #results.high_rate kbit/s between 1800 and 38400 bit/s,
-while efficiency changed from #results.low_eff to #results.high_eff (@capacity).
-With no added delay and zero FER, DATA and reply transmission times scale
-inversely with capacity, giving constant predicted efficiency. The prediction
-includes DATA framing and replies; setup/closing packets and processing consume
-additional time. These omitted costs explain why the
-baseline reaches #results.baseline_eff rather than #results.baseline_theory,
-a gap of #results.baseline_gap percentage points. Serialization costs
-scale with capacity, so they lower efficiency without a strong capacity trend.
+*Capacity.* Between 1,800 and 38,400 bit/s, throughput rose from
+#results.low_rate to #results.high_rate kbit/s and efficiency moved from
+#results.low_eff to #results.high_eff (@capacity). Faster transmission shortens
+file-data and overhead transmission times proportionally, so efficiency stays
+nearly constant. The model predicts #results.high_theory at every capacity; the
+1.7-point gap at 38,400 bit/s is consistent with fixed processing time taking a
+larger share of a 4.56 s transfer.
 
-*Packet size: overhead is a larger fraction of short packets.* DATA packet sizes
-64, 128, 256, 512 and 1000 bytes include the three-byte application header.
-Sending the 4096-byte file requires 68 DATA packets at the smallest setting and
-five at the largest. More headers and ACKs are therefore required per useful
-file byte for smaller packets. The plotted prediction includes these costs
-through stuffed DATA-frame lengths, frame count and reply transmission. Predicted
-and measured efficiency rise as useful data occupies a larger fraction of transmission time. The size
-axis shows the configured packet size, not an averaged wire-frame length.
+*Frame size.* Efficiency rose from #results.small_eff at 64 bytes to
+#results.large_eff at 1,000 bytes (@frame-size), against #results.small_theory and
+#results.large_theory predicted. Larger frames carry more file bytes per header
+and reply, reducing the number of I frames from 298 to 17.
+Gains diminish as this per-frame overhead shrinks, while opening, START, END and
+closing keep a fixed cost.
 
-*Propagation delay: the measured time contains extra round trips.* At 100 ms
-added one-way delay, theory predicts #results.delay_theory whereas measured
-efficiency is #results.delay_eff (@delay). The formula models DATA cycles and
-includes ACK serialization but omits setup/control/closing exchanges. Between zero and
-100 ms, the DATA interval grew by #results.data_delta s, while full-transfer
-time grew by #results.full_delta s; #results.outside_delta s of the increase was
-outside DATA. These surrounding exchanges also incur propagation delay, which
-explains why the reference underestimates total waiting time.
+*Propagation delay.* At 100 ms, measured efficiency is #results.delay_eff against
+#results.delay_theory predicted (@delay). Each exchange that waits for a reply
+adds one round trip ($2T_"prop"$ = 0.2 s) during which the link is idle. Adding
+100 ms lengthened the transfer by #results.full_delta s, matching the model's
+7.50 s: the 33 I frames carrying DATA packets account for #results.data_delta s,
+and opening, START, END and closing (4.5 round trips) for #results.outside_delta s.
+A model counting only DATA packets would therefore underestimate the delay cost by 12% (predicting 6.6s).
 
-*Errors: timeout recovery differs from an ordinary repeated attempt.* At a target
-FER of 20%, measured efficiency is #results.fer_eff against #results.fer_theory
-predicted (@fer). The simple factor $1-p_e$ assumes independent, equal-duration
-attempts at the target FER. A valid REJ can trigger a prompt retry, but a missing or corrupted
-reply can require the four-second timeout. The cable also corrupts ACKs, and
-short frames have different error probabilities from the reference frame.
-The implementation permits three retransmissions, rather than unlimited retries.
-These differences and random recovery paths can produce a gap even with 20
-repetitions per FER setting.
-
-Software handling and userspace timing add further costs absent from the ideal
-reference. The measurements establish the total gap, without isolating the
-contribution of each omitted cost.
+*Errors.* At 20% target FER, measured efficiency is #results.fer_eff, 3.8
+percentage points below the #results.fer_theory predicted (@fer). A frame with a valid header and
+corrupt data receives REJ and is retransmitted immediately, whereas a corrupted
+header or reply leaves the transmitter waiting for the four-second timeout, a
+wait outside the model. Shorter I frames (START, END and the final DATA frame)
+have lower error probabilities than the target, which favours the measurement.
+Two of the 20 transfers at 20% FER failed after exhausting the three retries.
 
 #include "assets/results-summary.typ"
 
 = Conclusions
-Of the #results.total saved transfers, #results.passed delivered the original
-file correctly. Larger payloads improved
-useful efficiency by reducing overhead per file byte. Higher capacity increased
-throughput with nearly constant efficiency, while propagation delay and frame
-errors reduced both. The simple Stop-and-Wait reference describes broad utilisation trends;
-remaining differences reflect protocol overhead, connection management,
-processing and timeout recovery.
+Figures 1–4 and Table 2 show that larger frames improved efficiency because fewer
+headers and replies were needed to send the same file. Higher capacity made
+transfers faster, but efficiency stayed nearly constant because both data and
+control messages took less time to send. Delay and errors lowered efficiency by
+adding time spent waiting for replies and sending frames again. Without errors,
+the model stayed within 1.7 percentage points of every measurement. At 20% FER, the model exceeded the measurement
+by 3.8 points, a shortfall consistent with timeout waits after corrupted headers
+or replies. Four of the 100 noisy runs (FER > 0) failed, so efficiency should be
+considered together with the number of successful transfers.
 
-*AI Disclaimer:* AI assisted in preparing the evaluation scripts and report.
+*AI Disclaimer:* AI assisted in preparing the evaluation scripts and refining the report wording and formatting.
