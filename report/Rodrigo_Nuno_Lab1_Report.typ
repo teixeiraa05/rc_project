@@ -48,7 +48,7 @@
     ],
   )
   #v(1mm)
-  *Practical class:* 3LEIC02 #h(1fr) 4 November 2026
+  *Practical class:* 3LEIC02 #h(1fr) 8 November 2026
 ]
 
 #v(5mm)
@@ -84,7 +84,7 @@ to the receiving application.
 
 The link layer uses Stop-and-Wait Automatic Repeat Request (ARQ) to recover
 from errors. After each I frame, the transmitter waits for a reply. Replies
-confirm reception (RR/REJ) or request retransmission; a timeout also
+confirm reception (RR) or request retransmission (REJ); a timeout also
 triggers retransmission. Sequence numbers alternate between 0 and 1 so the
 receiver can acknowledge duplicates without passing them to the application twice.
 Waiting for replies reduces the time available to send file data. 
@@ -151,13 +151,14 @@ Table 2 reports reliability.
 
 The class theoretical model counts successful frame-transmission time. With $a=T_"prop"/T_f$,
 $ S_"frame"=(1-p_e)/(1+2a) = ((1-p_e)T_f)/(T_f+2T_"prop") = T_f/E[T_"del"]. $
-Thus the ideal cycle and expected delivery time ($E[T_"del"]$) are
-$ T_"cycle"=T_f+2T_"prop", quad E[T_"del"] = T_"cycle"/(1-p_e). $
-With 8N1, $T_f=10L/C$. Including a five-byte reply, each I frame $j$ has
-$ T_"cycle"=T_f+T_"reply"+2T_"prop", quad
-  E[T_("del",j)] = (10(L_j+5)/C+2T_"prop")/(1-p_e). $
-Counting only I frames carrying DATA, $S_("file,DATA") = (8M)/(C sum_j E[T_("del",j)])$.
-Adding START/END delivery and both handshakes gives the expected full-transfer time:
+Thus the expected delivery time of one frame is
+$ E[T_"del"] = T_"cycle"/(1-p_e), quad T_"cycle" = T_f + 2T_"prop". $
+With 8N1 and a five-byte reply, the $j$-th I frame carrying a DATA packet
+($j = 1, ..., N$), of measured length $L_j$, has
+$ T_("cycle",j) = (10 L_j)/C + T_"reply" + 2T_"prop", quad T_"reply" = 50/C, quad
+  E[T_("del",j)] = T_("cycle",j)/(1-p_e). $
+Summing the delivery times of all I frames carrying DATA packets, START, END and
+both handshakes gives the expected full-transfer time:
 $ E[T_"transfer"] = E[T_"open"] + E[T_"START"] + sum_j E[T_("del",j)] + E[T_"END"] + E[T_"close"]. $
 #block(width: 100%, above: 0.75em, below: 0.75em)[
   #align(center, box(stroke: 0.6pt, inset: 8pt)[
@@ -208,7 +209,7 @@ adds one round trip ($2T_"prop"$ = 0.2 s) during which the link is idle. Adding
 100 ms lengthened the transfer by #results.full_delta s, matching the model's
 7.50 s: the 33 I frames carrying DATA packets account for #results.data_delta s,
 and opening, START, END and closing (4.5 round trips) for #results.outside_delta s.
-A model counting only DATA packets would therefore underestimate the delay cost by 12% (predicting 6.6s).
+A model counting only DATA packets would therefore underestimate the delay cost by 12% (predicting 6.6 s).
 
 *Errors.* At 20% target FER, measured efficiency is #results.fer_eff, 3.8
 percentage points below the #results.fer_theory predicted (@fer). A frame with a valid header and
@@ -221,14 +222,17 @@ Two of the 20 transfers at 20% FER failed after exhausting the three retries.
 #include "assets/results-summary.typ"
 
 = Conclusions
-Figures 1–4 and Table 2 show that larger frames improved efficiency because fewer
-headers and replies were needed to send the same file. Higher capacity made
-transfers faster, but efficiency stayed nearly constant because both data and
-control messages took less time to send. Delay and errors lowered efficiency by
-adding time spent waiting for replies and sending frames again. Without errors,
-the model stayed within 1.7 percentage points of every measurement. At 20% FER, the model exceeded the measurement
-by 3.8 points, a shortfall consistent with timeout waits after corrupted headers
-or replies. Four of the 100 noisy runs (FER > 0) failed, so efficiency should be
-considered together with the number of successful transfers.
+Frame size, delay and errors set the protocol's efficiency, while capacity kept
+it between #results.high_eff and #results.low_eff. Raising $L$ from 64 to 1,000 bytes increased $S$ from
+#results.small_eff to #results.large_eff by spreading each header and reply over
+more file bytes; 100 ms of delay and 20% FER reduced it to #results.delay_eff and
+#results.fer_eff by adding idle round trips and retransmissions.
+
+The model is valid for error-free transfers, staying within 1.7 percentage points
+of all 14 such configurations; the gap grows where fixed processing time weighs
+most, at high capacity and small frames. At 20% FER, it overestimated $S$ by 3.8
+points, consistent with timeouts after corrupted headers or replies. Unlike the
+model's unlimited attempts, four of the 100 noisy transfers failed after three
+retries, so efficiency must be read with completion rate.
 
 *AI Disclaimer:* AI assisted in preparing the evaluation scripts and refining the report wording and formatting.
