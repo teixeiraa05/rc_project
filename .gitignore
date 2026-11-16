@@ -1,3 +1,6 @@
 penguin-received.gif
 *.o
 /evaluation/
+/docs/
+/report/*
+!/report/*.pdf
